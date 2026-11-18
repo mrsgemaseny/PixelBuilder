@@ -1,0 +1,116 @@
+using System;
+using System.Drawing;
+using System.IO;
+using System.Windows.Forms;
+using System.Reflection;
+using PixelBuilder;
+
+internal static class Tests
+{
+    [STAThread]
+    private static int Main()
+    {
+        var global = new CanvasControl("global", 21, 15);
+        var local = new CanvasControl("local", 1000, 1000);
+        Check(global.IsInMap(new Point(9, 14)) && !global.IsInMap(new Point(0, 0)), "global contour");
+        Check(local.IsInMap(new Point(0, 0)) && local.IsInMap(new Point(999, 999)), "local dimensions");
+        Check(CanvasControl.ColorPalette.Count == 72, "extended color palette");
+        Check(CanvasControl.GlobalObjects.Count == 5 && CanvasControl.LocalObjects.Count == 3, "object catalogs");
+
+        string political = File.ReadAllText(@"C:\Users\murat\Downloads\MiniLife_global_map_pixelbuilder.json");
+        string nature = File.ReadAllText(@"C:\Users\murat\Downloads\MiniLife_global_nature_pixelbuilder.json");
+        Check(global.ImportJson(political), "legacy global political import");
+        Check(global.ActiveLayer == "political" && global.TotalBlockCount == 184, "political layer import");
+        Check(global.ImportJson(nature), "legacy global nature import");
+        Check(global.ActiveLayer == "landscape" && global.TotalBlockCount == 368, "two independent layers");
+        global.SetActiveLayer("political");
+        global.Cells[new Point(9, 14)] = "settlement_village";
+        global.SetActiveLayer("landscape");
+        global.Cells[new Point(9, 14)] = CanvasControl.RegisterColor(Color.FromArgb(12, 34, 56)).Id;
+        string saved = global.ExportJson();
+        var reloaded = new CanvasControl("global", 21, 15);
+        Check(reloaded.ImportJson(saved), "layered import");
+        Check(reloaded.TotalBlockCount == 368, "layered count");
+        reloaded.SetActiveLayer("political");
+        Check(reloaded.Objects[new Point(9, 14)] == "settlement_village", "legacy political object migration");
+        reloaded.SetActiveLayer("landscape");
+        Check(reloaded.Cells[new Point(9, 14)] == "color_0C2238", "custom color round trip");
+        Check(!local.ImportJson(saved), "map mode isolation");
+        local.SetActiveLayer("political");
+        local.Cells[new Point(500, 500)] = "building_large_house";
+        local.SetActiveLayer("landscape");
+        local.Cells[new Point(500, 500)] = "grass";
+        var localReloaded = new CanvasControl("local", 1000, 1000);
+        Check(localReloaded.ImportJson(local.ExportJson()), "local layered import");
+        Check(localReloaded.TotalBlockCount == 2, "local layer count");
+        localReloaded.SetActiveLayer("political");
+        Check(localReloaded.Objects[new Point(500, 500)] == "building_large_house", "local building round trip");
+        localReloaded.SetActiveLayer("landscape");
+        Check(localReloaded.Cells[new Point(500, 500)] == "grass", "local terrain round trip");
+        global.SetActiveLayer("political");
+        global.ActiveBlockId = "settlement_village";
+        var paint = typeof(CanvasControl).GetMethod("PaintCell", BindingFlags.NonPublic | BindingFlags.Instance);
+        Point villageCell = new Point(8, 14);
+        string politicalColor = global.Cells[villageCell];
+        global.SetActiveLayer("landscape");
+        string terrainColor = global.Cells[villageCell];
+        paint.Invoke(global, new object[] { villageCell, true });
+        Check(global.Objects[villageCell] == "settlement_village", "first village click");
+        paint.Invoke(global, new object[] { villageCell, true });
+        Check(global.Objects[villageCell] == "settlement_village_2", "second village click");
+        paint.Invoke(global, new object[] { villageCell, true });
+        Check(global.Objects[villageCell] == "settlement_village_3", "third village click");
+        paint.Invoke(global, new object[] { villageCell, true });
+        Check(global.Objects[villageCell] == "settlement_village_3", "village cap");
+        Check(global.Cells[villageCell] == terrainColor, "village preserves terrain");
+        global.SetActiveLayer("political");
+        Check(global.Cells[villageCell] == politicalColor, "village preserves politics");
+        foreach (BlockDef settlement in CanvasControl.GlobalObjects)
+        {
+            global.ActiveBlockId = settlement.Id;
+            paint.Invoke(global, new object[] { villageCell, true });
+            Check(global.Objects[villageCell] == settlement.Id, settlement.Id + " text marker");
+            Check(global.Cells[villageCell] == politicalColor, settlement.Id + " preserves politics");
+            global.SetActiveLayer("landscape");
+            Check(global.Cells[villageCell] == terrainColor, settlement.Id + " preserves terrain");
+            global.SetActiveLayer("political");
+        }
+        global.ActiveBlockId = "settlement_village";
+        paint.Invoke(global, new object[] { villageCell, true });
+        paint.Invoke(global, new object[] { villageCell, true });
+        paint.Invoke(global, new object[] { villageCell, true });
+        var villageReloaded = new CanvasControl("global", 21, 15);
+        Check(villageReloaded.ImportJson(global.ExportJson()), "village level import");
+        Check(villageReloaded.Objects[villageCell] == "settlement_village_3", "village level saved");
+        using (var form = new MainForm())
+        {
+            TabControl tabs = null;
+            foreach (Control control in form.Controls)
+                if (control is TabControl) tabs = (TabControl)control;
+            Check(tabs != null && tabs.TabPages.Count == 2, "two map tabs");
+            Check(tabs.TabPages[0].Text.Contains("Глобальная") && tabs.TabPages[1].Text.Contains("Локальная"), "map tab labels");
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-3000, -3000);
+            form.ShowInTaskbar = false;
+            form.Show();
+            Application.DoEvents();
+            form.PerformLayout();
+            var objectsField = typeof(MainForm).GetField("_objectPanel", BindingFlags.NonPublic | BindingFlags.Instance);
+            var objects = (FlowLayoutPanel)objectsField.GetValue(form);
+            Check(objects.Controls.Count == 5, "global objects only");
+            tabs.SelectedIndex = 1;
+            Application.DoEvents();
+            Check(objects.Controls.Count == 3, "local objects only");
+            tabs.SelectedIndex = 0;
+            Application.DoEvents();
+            Check(objects.Controls.Count == 5, "global objects restored");
+        }
+        Console.WriteLine("PIXELBUILDER_TESTS_PASS");
+        return 0;
+    }
+
+    private static void Check(bool condition, string name)
+    {
+        if (!condition) throw new Exception(name);
+    }
+}

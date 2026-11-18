@@ -1,0 +1,1846 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Text;
+using System.Windows.Forms;
+using System.Web.Script.Serialization;
+
+namespace PixelBuilder
+{
+    public enum ToolMode { Brush, Line, Rect, Fill, Eraser, Select, Paste }
+
+    public class BlockDef
+    {
+        public string Id { get; set; }
+        public string Name { get; set; }
+        public string Hotkey { get; set; }
+        public Color Color { get; set; }
+        public Color BorderColor { get; set; }
+        public string Symbol { get; set; }
+    }
+
+    public class MapLayer
+    {
+        public Dictionary<Point, string> Cells = new Dictionary<Point, string>();
+        public readonly Stack<Dictionary<Point, KeyValuePair<string, string>>> Undo =
+            new Stack<Dictionary<Point, KeyValuePair<string, string>>>();
+        public readonly Stack<Dictionary<Point, KeyValuePair<string, string>>> Redo =
+            new Stack<Dictionary<Point, KeyValuePair<string, string>>>();
+        public readonly Dictionary<Point, KeyValuePair<string, string>> Stroke =
+            new Dictionary<Point, KeyValuePair<string, string>>();
+    }
+
+    public class CanvasControl : Control
+    {
+        public const int CellSize = 32;
+        public int MapWidth { get; private set; }
+        public int MapHeight { get; private set; }
+        public string MapKind { get; private set; }
+
+        public float Zoom = 0.50f;
+        public PointF PanOffset = new PointF(0, 0);
+        public bool ShowGrid = true;
+        public ToolMode CurrentTool = ToolMode.Brush;
+        public string ActiveBlockId = "stone_wall";
+
+        private readonly MapLayer _politicalLayer = new MapLayer();
+        private readonly MapLayer _landscapeLayer = new MapLayer();
+        private readonly MapLayer _objectLayer = new MapLayer();
+        private MapLayer _activeLayer;
+        private MapLayer _editLayer;
+        public string ActiveLayer { get; private set; }
+        public bool ShowPoliticalLayer = true;
+        public bool ShowLandscapeLayer = true;
+        public Dictionary<Point, string> Cells { get { return _activeLayer.Cells; } private set { _activeLayer.Cells = value; } }
+        public Dictionary<Point, string> Objects { get { return _objectLayer.Cells; } }
+        public int TotalBlockCount { get { return _politicalLayer.Cells.Count + _landscapeLayer.Cells.Count + _objectLayer.Cells.Count; } }
+
+        public bool HasSelection = false;
+        public Rectangle SelectionBounds = Rectangle.Empty;
+        public Dictionary<Point, string> ClipboardBuffer = new Dictionary<Point, string>();
+        private Point _selectStartCell;
+        private bool _isSelecting = false;
+
+        public event Action<Point, string, bool> HoverChanged;
+        public event Action<int, int> StatsChanged;
+        public event Action HistoryChanged;
+        public event Action SelectionChanged;
+
+        private bool _isPanning = false;
+        private PointF _panStartMouse;
+        private PointF _panStartOffset;
+
+        private bool _isPainting = false;
+        private bool _isErasing = false;
+        private Point _lastPaintedCell = new Point(-9999, -9999);
+        private Point _toolStartCell;
+        private Point _currentHoverCell;
+        private bool _isHoverValid = false;
+
+        private Stack<Dictionary<Point, KeyValuePair<string, string>>> _undoStack { get { return _editLayer.Undo; } }
+        private Stack<Dictionary<Point, KeyValuePair<string, string>>> _redoStack { get { return _editLayer.Redo; } }
+        private Dictionary<Point, KeyValuePair<string, string>> _currentStrokeDiff { get { return _editLayer.Stroke; } }
+        private Dictionary<Point, string> EditCells { get { return _editLayer.Cells; } }
+        private static bool IsObject(string id) { BlockDef def; return BlockDefs.TryGetValue(id, out def) && !string.IsNullOrEmpty(def.Symbol); }
+        private void SetEditLayer(bool eraseObject = false)
+        {
+            _editLayer = IsObject(ActiveBlockId) || eraseObject ? _objectLayer : _activeLayer;
+            if (HistoryChanged != null) HistoryChanged();
+        }
+        public void RefreshEditingLayer() { SetEditLayer(); }
+
+        public static readonly List<BlockDef> Palette = new List<BlockDef>
+        {
+            new BlockDef { Id = "stone_wall", Name = "Stone Wall", Hotkey = "1", Color = Color.FromArgb(62, 66, 75),  BorderColor = Color.FromArgb(95, 102, 116) },
+            new BlockDef { Id = "wood_wall",  Name = "Wood Wall",  Hotkey = "2", Color = Color.FromArgb(118, 80, 48),  BorderColor = Color.FromArgb(152, 106, 65) },
+            new BlockDef { Id = "wood_floor", Name = "Wood Floor", Hotkey = "3", Color = Color.FromArgb(154, 114, 72), BorderColor = Color.FromArgb(126, 92, 56) },
+            new BlockDef { Id = "stone_floor",Name = "Stone Floor",Hotkey = "4", Color = Color.FromArgb(46, 50, 58),   BorderColor = Color.FromArgb(36, 39, 46) },
+            new BlockDef { Id = "door",       Name = "Doorway",    Hotkey = "5", Color = Color.FromArgb(208, 162, 70), BorderColor = Color.FromArgb(238, 192, 88) },
+            new BlockDef { Id = "water",      Name = "Water",      Hotkey = "6", Color = Color.FromArgb(45, 92, 138),  BorderColor = Color.FromArgb(64, 122, 182) },
+            new BlockDef { Id = "dirt",       Name = "Dirt",       Hotkey = "7", Color = Color.FromArgb(68, 50, 36),   BorderColor = Color.FromArgb(88, 66, 48) },
+            new BlockDef { Id = "pillar",     Name = "Pillar",     Hotkey = "8", Color = Color.FromArgb(98, 104, 118), BorderColor = Color.FromArgb(135, 142, 158) },
+            new BlockDef { Id = "grass",      Name = "Grass",      Hotkey = "9", Color = Color.FromArgb(52, 92, 48),   BorderColor = Color.FromArgb(70, 118, 65) },
+            new BlockDef { Id = "brick",      Name = "Red Brick",  Hotkey = "0", Color = Color.FromArgb(130, 52, 45),  BorderColor = Color.FromArgb(165, 68, 60) }
+        };
+
+        public static readonly Dictionary<string, BlockDef> BlockDefs = new Dictionary<string, BlockDef>();
+        public static readonly List<BlockDef> ColorPalette = new List<BlockDef>();
+        public static readonly List<BlockDef> GlobalObjects = new List<BlockDef>();
+        public static readonly List<BlockDef> LocalObjects = new List<BlockDef>();
+        private static readonly string[] GlobalLandRows = {
+            ".........RRRRRRR.....", ".........RRRRRRR.....", ".......YYRRRRRRRRG...",
+            "....MMYYYRRRRRRRRGGG.", "....MMYYYYYRRRRMMMGG.", "....MMMYYBBBBYMMMMMG.",
+            "..MMMMMBBBBBYYYYMMGG.", "..MMMMBBBBBBYYCCGGGG.", "..MMMMBBBBBYYYCCGG...",
+            "..MMMMBBBBMMYYMMM....", "..MMYYYYYMMMMMMMM....", "..MMYYYYYMMMM........",
+            "....YYCCYMMMM........", "......CCMMMM.........", ".......CMM..........."
+        };
+
+        static CanvasControl()
+        {
+            foreach (var b in Palette)
+            {
+                BlockDefs[b.Id] = b;
+            }
+            AddObject(GlobalObjects, "settlement_castle", "Замок", "З", Color.FromArgb(145, 81, 65));
+            AddObject(GlobalObjects, "settlement_fortress", "Крепость", "К", Color.FromArgb(125, 105, 92));
+            AddObject(GlobalObjects, "settlement_city", "Город", "Г", Color.FromArgb(207, 151, 74));
+            AddObject(GlobalObjects, "settlement_village", "Деревня", "Д", Color.FromArgb(171, 140, 88));
+            BlockDefs["settlement_village_2"] = new BlockDef { Id = "settlement_village_2", Name = "Деревня, уровень 2",
+                Symbol = "2Д", Hotkey = "", Color = Color.FromArgb(171, 140, 88), BorderColor = Color.FromArgb(126, 102, 64) };
+            BlockDefs["settlement_village_3"] = new BlockDef { Id = "settlement_village_3", Name = "Деревня, уровень 3",
+                Symbol = "3Д", Hotkey = "", Color = Color.FromArgb(171, 140, 88), BorderColor = Color.FromArgb(126, 102, 64) };
+            AddObject(GlobalObjects, "settlement_hamlet", "Село", "С", Color.FromArgb(128, 158, 91));
+            AddObject(LocalObjects, "building_large_house", "Большой дом", "Б", Color.FromArgb(174, 112, 74));
+            AddObject(LocalObjects, "building_small_house", "Маленький дом", "М", Color.FromArgb(192, 146, 96));
+            AddObject(LocalObjects, "building_hut", "Шалаш", "Ш", Color.FromArgb(116, 137, 77));
+            for (int hue = 0; hue < 12; hue++)
+            {
+                for (int shade = 0; shade < 6; shade++)
+                {
+                    Color color = FromHsv(hue * 30.0, 0.35 + (shade % 3) * 0.25, 0.42 + (shade / 3) * 0.38);
+                    BlockDef def = RegisterColor(color);
+                    ColorPalette.Add(def);
+                }
+            }
+        }
+
+        private static void AddObject(List<BlockDef> group, string id, string name, string symbol, Color color)
+        {
+            var def = new BlockDef { Id = id, Name = name, Hotkey = "", Symbol = symbol,
+                Color = color, BorderColor = ControlPaint.Dark(color) };
+            group.Add(def);
+            BlockDefs[id] = def;
+        }
+
+        private static Color FromHsv(double hue, double saturation, double value)
+        {
+            int sector = (int)Math.Floor(hue / 60.0) % 6;
+            double chroma = value * saturation;
+            double second = chroma * (1.0 - Math.Abs((hue / 60.0) % 2.0 - 1.0));
+            double offset = value - chroma;
+            double[] rgb = sector == 0 ? new[] { chroma, second, 0.0 } :
+                sector == 1 ? new[] { second, chroma, 0.0 } :
+                sector == 2 ? new[] { 0.0, chroma, second } :
+                sector == 3 ? new[] { 0.0, second, chroma } :
+                sector == 4 ? new[] { second, 0.0, chroma } : new[] { chroma, 0.0, second };
+            return Color.FromArgb((int)((rgb[0] + offset) * 255), (int)((rgb[1] + offset) * 255), (int)((rgb[2] + offset) * 255));
+        }
+
+        public static BlockDef RegisterColor(Color color)
+        {
+            string id = string.Format("color_{0:X2}{1:X2}{2:X2}", color.R, color.G, color.B);
+            BlockDef existing;
+            if (BlockDefs.TryGetValue(id, out existing)) return existing;
+            var def = new BlockDef { Id = id, Name = string.Format("RGB #{0:X2}{1:X2}{2:X2}", color.R, color.G, color.B),
+                Hotkey = "", Color = color, BorderColor = ControlPaint.Dark(color) };
+            BlockDefs[id] = def;
+            return def;
+        }
+
+        public static bool EnsureColorId(string id)
+        {
+            if (BlockDefs.ContainsKey(id)) return true;
+            if (!System.Text.RegularExpressions.Regex.IsMatch(id, @"^color_[0-9A-Fa-f]{6}$")) return false;
+            Color color = ColorTranslator.FromHtml("#" + id.Substring(6));
+            BlockDefs[id] = RegisterColor(color);
+            return true;
+        }
+
+        public CanvasControl(string mapKind, int width, int height)
+        {
+            MapKind = mapKind;
+            MapWidth = width;
+            MapHeight = height;
+            _activeLayer = _landscapeLayer;
+            _editLayer = _activeLayer;
+            ActiveLayer = "landscape";
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            BackColor = Color.FromArgb(10, 11, 14);
+
+            CenterOnMap();
+        }
+
+        public void SetActiveLayer(string layer)
+        {
+            if (layer != "political" && layer != "landscape") return;
+            if (layer == ActiveLayer) return;
+            ClearSelection();
+            ActiveLayer = layer;
+            _activeLayer = layer == "political" ? _politicalLayer : _landscapeLayer;
+            SetEditLayer();
+            if (layer == "political") ShowPoliticalLayer = true;
+            else ShowLandscapeLayer = true;
+            if (HistoryChanged != null) HistoryChanged();
+            NotifyStats();
+            Invalidate();
+        }
+
+        public bool IsInMap(Point cell)
+        {
+            if (cell.X < 0 || cell.X >= MapWidth || cell.Y < 0 || cell.Y >= MapHeight) return false;
+            return MapKind != "global" || GlobalLandRows[cell.Y][cell.X] != '.';
+        }
+
+        public Point ScreenToCell(Point screenPt)
+        {
+            float cx = Width * 0.5f;
+            float cy = Height * 0.5f;
+            float wx = (screenPt.X - cx) / Zoom - PanOffset.X;
+            float wy = (screenPt.Y - cy) / Zoom - PanOffset.Y;
+            return new Point((int)Math.Floor(wx / CellSize), (int)Math.Floor(wy / CellSize));
+        }
+
+        public RectangleF CellToScreenRect(Point cell)
+        {
+            float cx = Width * 0.5f;
+            float cy = Height * 0.5f;
+            float sx = (cell.X * CellSize + PanOffset.X) * Zoom + cx;
+            float sy = (cell.Y * CellSize + PanOffset.Y) * Zoom + cy;
+            float sz = CellSize * Zoom;
+            return new RectangleF(sx, sy, sz, sz);
+        }
+
+        public void MoveCamera(float dx, float dy)
+        {
+            PanOffset = new PointF(PanOffset.X + dx / Zoom, PanOffset.Y + dy / Zoom);
+            Invalidate();
+        }
+
+        public void CenterOnMap()
+        {
+            float targetWorldX = (MapWidth * 0.5f) * CellSize;
+            float targetWorldY = (MapHeight * 0.5f) * CellSize;
+            PanOffset = new PointF(-targetWorldX, -targetWorldY);
+            Zoom = MapKind == "global" ? 1.0f : 0.50f;
+            NotifyStats();
+            Invalidate();
+        }
+
+        public void CenterOnOrigin()
+        {
+            PanOffset = new PointF(0, 0);
+            Zoom = 1.0f;
+            NotifyStats();
+            Invalidate();
+        }
+
+        public void CopySelection()
+        {
+            if (!HasSelection || SelectionBounds.Width <= 0 || SelectionBounds.Height <= 0) return;
+
+            ClipboardBuffer.Clear();
+            for (int x = SelectionBounds.Left; x < SelectionBounds.Right; x++)
+            {
+                for (int y = SelectionBounds.Top; y < SelectionBounds.Bottom; y++)
+                {
+                    Point pt = new Point(x, y);
+                    if (Cells.ContainsKey(pt))
+                    {
+                        Point rel = new Point(x - SelectionBounds.Left, y - SelectionBounds.Top);
+                        ClipboardBuffer[rel] = Cells[pt];
+                    }
+                }
+            }
+        }
+
+        public void CutSelection()
+        {
+            if (!HasSelection || SelectionBounds.Width <= 0 || SelectionBounds.Height <= 0) return;
+
+            CopySelection();
+
+            _editLayer = _activeLayer;
+            _currentStrokeDiff.Clear();
+            for (int x = SelectionBounds.Left; x < SelectionBounds.Right; x++)
+            {
+                for (int y = SelectionBounds.Top; y < SelectionBounds.Bottom; y++)
+                {
+                    Point pt = new Point(x, y);
+                    if (Cells.ContainsKey(pt))
+                    {
+                        SetCellInternal(pt, "");
+                    }
+                }
+            }
+            CommitStroke();
+            ClearSelection();
+            Invalidate();
+        }
+
+        public void DeleteSelection()
+        {
+            if (!HasSelection || SelectionBounds.Width <= 0 || SelectionBounds.Height <= 0) return;
+
+            _editLayer = _activeLayer;
+            _currentStrokeDiff.Clear();
+            for (int x = SelectionBounds.Left; x < SelectionBounds.Right; x++)
+            {
+                for (int y = SelectionBounds.Top; y < SelectionBounds.Bottom; y++)
+                {
+                    Point pt = new Point(x, y);
+                    if (Cells.ContainsKey(pt))
+                    {
+                        SetCellInternal(pt, "");
+                    }
+                }
+            }
+            CommitStroke();
+            ClearSelection();
+            Invalidate();
+        }
+
+        public void StartPaste()
+        {
+            if (ClipboardBuffer.Count == 0)
+            {
+                MessageBox.Show("Clipboard is empty! Select an area and click Copy or Cut first.", "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            CurrentTool = ToolMode.Paste;
+            ClearSelection();
+            Invalidate();
+        }
+
+        public void CommitPasteAt(Point targetOrigin)
+        {
+            if (ClipboardBuffer.Count == 0) return;
+
+            _editLayer = _activeLayer;
+            _currentStrokeDiff.Clear();
+            foreach (var kvp in ClipboardBuffer)
+            {
+                Point targetCell = new Point(targetOrigin.X + kvp.Key.X, targetOrigin.Y + kvp.Key.Y);
+                if (IsInMap(targetCell))
+                {
+                    SetCellInternal(targetCell, kvp.Value);
+                }
+            }
+            CommitStroke();
+            Invalidate();
+        }
+
+        public void ClearSelection()
+        {
+            HasSelection = false;
+            SelectionBounds = Rectangle.Empty;
+            if (SelectionChanged != null) SelectionChanged();
+            Invalidate();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            _currentHoverCell = ScreenToCell(e.Location);
+            _isHoverValid = IsInMap(_currentHoverCell);
+
+            string bid = (_isHoverValid && Cells.ContainsKey(_currentHoverCell)) ? Cells[_currentHoverCell] : "Empty";
+            if (HoverChanged != null) HoverChanged(_currentHoverCell, bid, _isHoverValid);
+
+            if (_isPanning)
+            {
+                PanOffset = new PointF(_panStartOffset.X + (e.X - _panStartMouse.X) / Zoom,
+                                       _panStartOffset.Y + (e.Y - _panStartMouse.Y) / Zoom);
+                Invalidate();
+            }
+            else if (_isSelecting)
+            {
+                int x0 = Math.Min(_selectStartCell.X, _currentHoverCell.X);
+                int x1 = Math.Max(_selectStartCell.X, _currentHoverCell.X);
+                int y0 = Math.Min(_selectStartCell.Y, _currentHoverCell.Y);
+                int y1 = Math.Max(_selectStartCell.Y, _currentHoverCell.Y);
+                SelectionBounds = new Rectangle(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+                HasSelection = true;
+                if (SelectionChanged != null) SelectionChanged();
+                Invalidate();
+            }
+            else if (_isPainting)
+            {
+                if (CurrentTool == ToolMode.Brush || CurrentTool == ToolMode.Eraser)
+                {
+                    if (_isHoverValid) PaintLineTo(_currentHoverCell);
+                }
+                else
+                {
+                    Invalidate();
+                }
+            }
+            else
+            {
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            Focus();
+
+            if (e.Button == MouseButtons.Middle || (e.Button == MouseButtons.Left && (ModifierKeys & Keys.Space) != 0))
+            {
+                _isPanning = true;
+                _panStartMouse = e.Location;
+                _panStartOffset = PanOffset;
+                Cursor = Cursors.SizeAll;
+                return;
+            }
+
+            Point clickedCell = ScreenToCell(e.Location);
+
+            if (e.Button == MouseButtons.Right)
+            {
+                if (CurrentTool == ToolMode.Paste)
+                {
+                    CurrentTool = ToolMode.Brush;
+                    Invalidate();
+                    return;
+                }
+                if (HasSelection)
+                {
+                    ClearSelection();
+                    return;
+                }
+            }
+
+            if (CurrentTool == ToolMode.Paste)
+            {
+                if (e.Button == MouseButtons.Left && _isHoverValid)
+                {
+                    CommitPasteAt(clickedCell);
+                }
+                return;
+            }
+
+            if (CurrentTool == ToolMode.Select)
+            {
+                if (e.Button == MouseButtons.Left)
+                {
+                    _isSelecting = true;
+                    _selectStartCell = clickedCell;
+                    SelectionBounds = new Rectangle(clickedCell.X, clickedCell.Y, 1, 1);
+                    HasSelection = true;
+                    if (SelectionChanged != null) SelectionChanged();
+                    Invalidate();
+                }
+                return;
+            }
+
+            if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
+            {
+                if (!IsInMap(clickedCell)) return;
+
+                _isPainting = true;
+                _isErasing = (e.Button == MouseButtons.Right) || (CurrentTool == ToolMode.Eraser);
+                _toolStartCell = clickedCell;
+                SetEditLayer(_isErasing && _objectLayer.Cells.ContainsKey(clickedCell));
+                _currentStrokeDiff.Clear();
+
+                ToolMode effTool = CurrentTool;
+                if ((ModifierKeys & Keys.Shift) != 0) effTool = ToolMode.Line;
+
+                if (effTool == ToolMode.Fill)
+                {
+                    ExecuteFill(_toolStartCell, _isErasing ? "" : ActiveBlockId);
+                    CommitStroke();
+                    _isPainting = false;
+                }
+                else if (effTool == ToolMode.Brush || effTool == ToolMode.Eraser)
+                {
+                    PaintCell(_toolStartCell, true);
+                    _lastPaintedCell = _toolStartCell;
+                }
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (_isPanning && (e.Button == MouseButtons.Middle || e.Button == MouseButtons.Left))
+            {
+                _isPanning = false;
+                Cursor = Cursors.Default;
+                return;
+            }
+
+            if (_isSelecting)
+            {
+                _isSelecting = false;
+                Invalidate();
+                return;
+            }
+
+            if (_isPainting)
+            {
+                ToolMode effTool = CurrentTool;
+                if ((ModifierKeys & Keys.Shift) != 0) effTool = ToolMode.Line;
+
+                if (effTool == ToolMode.Line || effTool == ToolMode.Rect)
+                {
+                    var preview = GetToolPreviewCells();
+                    string target = _isErasing ? "" : ActiveBlockId;
+                    foreach (var c in preview)
+                    {
+                        if (IsInMap(c)) SetCellInternal(c, target);
+                    }
+                }
+
+                CommitStroke();
+                _isPainting = false;
+                _lastPaintedCell = new Point(-9999, -9999);
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            float factor = e.Delta > 0 ? 1.15f : (1.0f / 1.15f);
+            float newZoom = Math.Max(0.08f, Math.Min(8.0f, Zoom * factor));
+            if (Math.Abs(newZoom - Zoom) < 0.001f) return;
+
+            float cx = Width * 0.5f;
+            float cy = Height * 0.5f;
+            float wx = (e.X - cx) / Zoom - PanOffset.X;
+            float wy = (e.Y - cy) / Zoom - PanOffset.Y;
+
+            Zoom = newZoom;
+            PanOffset = new PointF((e.X - cx) / Zoom - wx,
+                                   (e.Y - cy) / Zoom - wy);
+
+            NotifyStats();
+            Invalidate();
+        }
+
+        private void PaintCell(Point cell, bool clicked = false)
+        {
+            if (!IsInMap(cell)) return;
+            string target = _isErasing ? "" : ActiveBlockId;
+            if (IsObject(target)) _editLayer = _objectLayer;
+            if (clicked && target == "settlement_village" && EditCells.ContainsKey(cell))
+            {
+                string previous = EditCells[cell];
+                if (previous == "settlement_village") target = "settlement_village_2";
+                else if (previous == "settlement_village_2") target = "settlement_village_3";
+                else if (previous == "settlement_village_3") target = previous;
+            }
+            SetCellInternal(cell, target);
+        }
+
+        private void PaintLineTo(Point target)
+        {
+            if (_lastPaintedCell == target) return;
+            var pts = BresenhamLine(_lastPaintedCell, target);
+            foreach (var p in pts)
+            {
+                if (IsInMap(p)) PaintCell(p);
+            }
+            _lastPaintedCell = target;
+            Invalidate();
+        }
+
+        private void SetCellInternal(Point cell, string newBid)
+        {
+            if (!IsInMap(cell)) return;
+            string oldBid = EditCells.ContainsKey(cell) ? EditCells[cell] : "";
+            if (oldBid == newBid) return;
+
+            if (!_currentStrokeDiff.ContainsKey(cell))
+            {
+                _currentStrokeDiff[cell] = new KeyValuePair<string, string>(oldBid, newBid);
+            }
+            else
+            {
+                _currentStrokeDiff[cell] = new KeyValuePair<string, string>(_currentStrokeDiff[cell].Key, newBid);
+            }
+
+            if (string.IsNullOrEmpty(newBid))
+            {
+                EditCells.Remove(cell);
+            }
+            else
+            {
+                EditCells[cell] = newBid;
+            }
+            NotifyStats();
+        }
+
+        private void CommitStroke()
+        {
+            if (_currentStrokeDiff.Count == 0) return;
+            _undoStack.Push(new Dictionary<Point, KeyValuePair<string, string>>(_currentStrokeDiff));
+            _redoStack.Clear();
+            if (HistoryChanged != null) HistoryChanged();
+            NotifyStats();
+        }
+
+        public void Undo()
+        {
+            if (_undoStack.Count == 0) return;
+            var diff = _undoStack.Pop();
+            _redoStack.Push(diff);
+            foreach (var kvp in diff)
+            {
+                if (string.IsNullOrEmpty(kvp.Value.Key))
+                    EditCells.Remove(kvp.Key);
+                else
+                    EditCells[kvp.Key] = kvp.Value.Key;
+            }
+            if (HistoryChanged != null) HistoryChanged();
+            NotifyStats();
+            Invalidate();
+        }
+
+        public void Redo()
+        {
+            if (_redoStack.Count == 0) return;
+            var diff = _redoStack.Pop();
+            _undoStack.Push(diff);
+            foreach (var kvp in diff)
+            {
+                if (string.IsNullOrEmpty(kvp.Value.Value))
+                    EditCells.Remove(kvp.Key);
+                else
+                    EditCells[kvp.Key] = kvp.Value.Value;
+            }
+            if (HistoryChanged != null) HistoryChanged();
+            NotifyStats();
+            Invalidate();
+        }
+
+        public bool CanUndo { get { return _undoStack.Count > 0; } }
+        public bool CanRedo { get { return _redoStack.Count > 0; } }
+
+        public void ClearAll()
+        {
+            if (EditCells.Count == 0) return;
+            var diff = new Dictionary<Point, KeyValuePair<string, string>>();
+            foreach (var kvp in EditCells)
+            {
+                diff[kvp.Key] = new KeyValuePair<string, string>(kvp.Value, "");
+            }
+            _undoStack.Push(diff);
+            _redoStack.Clear();
+            EditCells.Clear();
+            ClearSelection();
+            if (HistoryChanged != null) HistoryChanged();
+            NotifyStats();
+            Invalidate();
+        }
+
+        private void ExecuteFill(Point start, string target)
+        {
+            if (!IsInMap(start)) return;
+            string source = EditCells.ContainsKey(start) ? EditCells[start] : "";
+            if (source == target) return;
+
+            int minX = int.MaxValue, maxX = int.MinValue, minY = int.MaxValue, maxY = int.MinValue;
+            if (string.IsNullOrEmpty(source))
+            {
+                if (EditCells.Count == 0) return;
+
+                foreach (var pt in EditCells.Keys)
+                {
+                    if (pt.X < minX) minX = pt.X;
+                    if (pt.X > maxX) maxX = pt.X;
+                    if (pt.Y < minY) minY = pt.Y;
+                    if (pt.Y > maxY) maxY = pt.Y;
+                }
+
+                if (start.X < minX || start.X > maxX || start.Y < minY || start.Y > maxY)
+                {
+                    MessageBox.Show("Cannot fill outside! Click inside enclosed walls.", "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                minX -= 1; maxX += 1;
+                minY -= 1; maxY += 1;
+            }
+
+            var queue = new Queue<Point>();
+            var visited = new HashSet<Point>();
+            var fillPoints = new List<Point>();
+            queue.Enqueue(start);
+            visited.Add(start);
+
+            bool leaked = false;
+            int maxCount = 5000;
+
+            while (queue.Count > 0)
+            {
+                Point cur = queue.Dequeue();
+                fillPoints.Add(cur);
+
+                if (fillPoints.Count > maxCount)
+                {
+                    leaked = true;
+                    break;
+                }
+
+                if (string.IsNullOrEmpty(source))
+                {
+                    if (cur.X <= minX || cur.X >= maxX || cur.Y <= minY || cur.Y >= maxY)
+                    {
+                        leaked = true;
+                        break;
+                    }
+                }
+
+                Point[] neighbors = {
+                    new Point(cur.X + 1, cur.Y),
+                    new Point(cur.X - 1, cur.Y),
+                    new Point(cur.X, cur.Y + 1),
+                    new Point(cur.X, cur.Y - 1)
+                };
+
+                foreach (var n in neighbors)
+                {
+                    if (IsInMap(n) && !visited.Contains(n))
+                    {
+                        visited.Add(n);
+                        string nbBid = EditCells.ContainsKey(n) ? EditCells[n] : "";
+                        if (nbBid == source) queue.Enqueue(n);
+                    }
+                }
+            }
+
+            if (!leaked)
+            {
+                foreach (var p in fillPoints)
+                {
+                    SetCellInternal(p, target);
+                }
+            }
+            else
+            {
+                MessageBox.Show("Room is not enclosed (leak detected)!\nClose the wall perimeter before filling.", "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private List<Point> GetToolPreviewCells()
+        {
+            ToolMode effTool = CurrentTool;
+            if ((ModifierKeys & Keys.Shift) != 0) effTool = ToolMode.Line;
+
+            if (effTool == ToolMode.Line)
+            {
+                return BresenhamLine(_toolStartCell, _currentHoverCell);
+            }
+            else if (effTool == ToolMode.Rect)
+            {
+                int x0 = Math.Min(_toolStartCell.X, _currentHoverCell.X);
+                int x1 = Math.Max(_toolStartCell.X, _currentHoverCell.X);
+                int y0 = Math.Min(_toolStartCell.Y, _currentHoverCell.Y);
+                int y1 = Math.Max(_toolStartCell.Y, _currentHoverCell.Y);
+                var list = new List<Point>();
+                for (int x = x0; x <= x1; x++)
+                {
+                    for (int y = y0; y <= y1; y++)
+                    {
+                        if (x == x0 || x == x1 || y == y0 || y == y1)
+                            list.Add(new Point(x, y));
+                    }
+                }
+                return list;
+            }
+            return new List<Point>();
+        }
+
+        private List<Point> BresenhamLine(Point p0, Point p1)
+        {
+            var pts = new List<Point>();
+            int x0 = p0.X, y0 = p0.Y;
+            int x1 = p1.X, y1 = p1.Y;
+            int dx = Math.Abs(x1 - x0), dy = -Math.Abs(y1 - y0);
+            int sx = x0 < x1 ? 1 : -1;
+            int sy = y0 < y1 ? 1 : -1;
+            int err = dx + dy;
+
+            while (true)
+            {
+                pts.Add(new Point(x0, y0));
+                if (x0 == x1 && y0 == y1) break;
+                int e2 = 2 * err;
+                if (e2 >= dy) { err += dy; x0 += sx; }
+                if (e2 <= dx) { err += dx; y0 += sy; }
+            }
+            return pts;
+        }
+
+        public void NotifyStats()
+        {
+            if (StatsChanged != null) StatsChanged(TotalBlockCount, (int)Math.Round(Zoom * 100));
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+
+            float cx = Width * 0.5f;
+            float cy = Height * 0.5f;
+
+            float mapWorldW = MapWidth * CellSize;
+            float mapWorldH = MapHeight * CellSize;
+            float mapScreenX = PanOffset.X * Zoom + cx;
+            float mapScreenY = PanOffset.Y * Zoom + cy;
+            float mapScreenW = mapWorldW * Zoom;
+            float mapScreenH = mapWorldH * Zoom;
+
+            // 1. Draw 1000x1000 Map Surface Background
+            RectangleF mapRect = new RectangleF(mapScreenX, mapScreenY, mapScreenW, mapScreenH);
+            using (Brush mapBg = new SolidBrush(Color.FromArgb(18, 20, 25)))
+                g.FillRectangle(mapBg, mapRect);
+            if (MapKind == "global")
+            {
+                using (Brush land = new SolidBrush(Color.FromArgb(44, 48, 56)))
+                {
+                    for (int y = 0; y < MapHeight; y++)
+                        for (int x = 0; x < MapWidth; x++)
+                            if (IsInMap(new Point(x, y))) g.FillRectangle(land, CellToScreenRect(new Point(x, y)));
+                }
+            }
+
+            // 2. Visible grid lines
+            Point tl = ScreenToCell(new Point(0, 0));
+            Point br = ScreenToCell(new Point(Width, Height));
+
+            int startX = Math.Max(0, tl.X - 1);
+            int endX = Math.Min(MapWidth, br.X + 1);
+            int startY = Math.Max(0, tl.Y - 1);
+            int endY = Math.Min(MapHeight, br.Y + 1);
+
+            if (ShowGrid && Zoom >= 0.18f)
+            {
+                using (Pen gridPen = new Pen(Color.FromArgb(32, 36, 45), 1f))
+                using (Pen majorPen = new Pen(Color.FromArgb(48, 54, 70), 1.2f))
+                {
+                    for (int x = startX; x <= endX; x++)
+                    {
+                        float sx = (x * CellSize + PanOffset.X) * Zoom + cx;
+                        float yTop = Math.Max(0, mapScreenY);
+                        float yBot = Math.Min(Height, mapScreenY + mapScreenH);
+                        Pen p = (x % 10 == 0) ? majorPen : gridPen;
+                        g.DrawLine(p, sx, yTop, sx, yBot);
+                    }
+                    for (int y = startY; y <= endY; y++)
+                    {
+                        float sy = (y * CellSize + PanOffset.Y) * Zoom + cy;
+                        float xLeft = Math.Max(0, mapScreenX);
+                        float xRight = Math.Min(Width, mapScreenX + mapScreenW);
+                        Pen p = (y % 10 == 0) ? majorPen : gridPen;
+                        g.DrawLine(p, xLeft, sy, xRight, sy);
+                    }
+                }
+            }
+
+            // 3. Independent layers: landscape below politics.
+            if (ShowLandscapeLayer) DrawLayer(g, _landscapeLayer.Cells, startX, endX, startY, endY, false);
+            if (ShowPoliticalLayer) DrawLayer(g, _politicalLayer.Cells, startX, endX, startY, endY, true);
+            DrawObjectLabels(g, _objectLayer.Cells, startX, endX, startY, endY);
+
+            // 4. Map boundary
+            using (Pen borderPen = new Pen(Color.FromArgb(220, 80, 130, 210), 2.5f))
+            {
+                g.DrawRectangle(borderPen, mapRect.X, mapRect.Y, mapRect.Width, mapRect.Height);
+            }
+
+            // 5. EXACT CENTER MARKER (500, 500)
+            float centerWorldX = (MapWidth * 0.5f) * CellSize;
+            float centerWorldY = (MapHeight * 0.5f) * CellSize;
+            float centerScrX = (centerWorldX + PanOffset.X) * Zoom + cx;
+            float centerScrY = (centerWorldY + PanOffset.Y) * Zoom + cy;
+
+            if (MapKind == "local")
+            {
+                using (Pen centerPen = new Pen(Color.FromArgb(220, 230, 235, 240), 2.0f))
+                using (Brush centerBrush = new SolidBrush(Color.FromArgb(180, 230, 235, 240)))
+                {
+                    g.DrawLine(centerPen, centerScrX - 20, centerScrY, centerScrX + 20, centerScrY);
+                    g.DrawLine(centerPen, centerScrX, centerScrY - 20, centerScrX, centerScrY + 20);
+                    g.DrawEllipse(centerPen, centerScrX - 10, centerScrY - 10, 20, 20);
+                    g.FillEllipse(centerBrush, centerScrX - 3, centerScrY - 3, 6, 6);
+                }
+            }
+
+            // 6. Selection Box (Scissors Cut/Copy Rect)
+            if (HasSelection && SelectionBounds.Width > 0 && SelectionBounds.Height > 0)
+            {
+                Point selTL = new Point(SelectionBounds.Left, SelectionBounds.Top);
+                Point selBR = new Point(SelectionBounds.Right, SelectionBounds.Bottom);
+                RectangleF rTL = CellToScreenRect(selTL);
+                RectangleF rBR = CellToScreenRect(selBR);
+
+                float sx = rTL.X;
+                float sy = rTL.Y;
+                float sw = rBR.X - rTL.X;
+                float sh = rBR.Y - rTL.Y;
+
+                using (Brush selBrush = new SolidBrush(Color.FromArgb(55, 100, 180, 255)))
+                {
+                    g.FillRectangle(selBrush, sx, sy, sw, sh);
+                }
+                using (Pen selPen = new Pen(Color.FromArgb(255, 120, 200, 255), 2.0f))
+                {
+                    selPen.DashStyle = DashStyle.Dash;
+                    g.DrawRectangle(selPen, sx, sy, sw, sh);
+                }
+            }
+
+            // 7. Paste Ghost Preview
+            if (CurrentTool == ToolMode.Paste && ClipboardBuffer.Count > 0 && _isHoverValid)
+            {
+                foreach (var kvp in ClipboardBuffer)
+                {
+                    Point ghostCell = new Point(_currentHoverCell.X + kvp.Key.X, _currentHoverCell.Y + kvp.Key.Y);
+                    if (IsInMap(ghostCell) && BlockDefs.ContainsKey(kvp.Value))
+                    {
+                        var def = BlockDefs[kvp.Value];
+                        RectangleF rect = CellToScreenRect(ghostCell);
+                        if (IsObject(kvp.Value)) DrawPreviewSymbol(g, kvp.Value, ghostCell);
+                        else
+                        {
+                            using (Brush b = new SolidBrush(Color.FromArgb(170, def.Color)))
+                                g.FillRectangle(b, rect);
+                            using (Pen p = new Pen(Color.FromArgb(220, def.BorderColor), 1f))
+                                g.DrawRectangle(p, rect.X, rect.Y, rect.Width, rect.Height);
+                        }
+                    }
+                }
+            }
+            else if (_isPainting && (CurrentTool == ToolMode.Line || CurrentTool == ToolMode.Rect))
+            {
+                var preview = GetToolPreviewCells();
+                Color pcol = _isErasing ? Color.FromArgb(180, 220, 50, 50) : Color.FromArgb(160, BlockDefs[ActiveBlockId].Color);
+                using (Brush b = new SolidBrush(pcol))
+                {
+                    foreach (var p in preview)
+                    {
+                        if (IsInMap(p))
+                        {
+                            RectangleF rect = CellToScreenRect(p);
+                            if (IsObject(ActiveBlockId) && !_isErasing) DrawPreviewSymbol(g, ActiveBlockId, p);
+                            else g.FillRectangle(b, rect);
+                        }
+                    }
+                }
+            }
+            else if (!_isPanning && _isHoverValid && CurrentTool != ToolMode.Select && !IsObject(ActiveBlockId))
+            {
+                RectangleF hrect = CellToScreenRect(_currentHoverCell);
+                Color hcol = (CurrentTool == ToolMode.Eraser) ? Color.FromArgb(100, 220, 60, 60) : Color.FromArgb(35, 235, 240, 245);
+                using (Brush b = new SolidBrush(hcol))
+                    g.FillRectangle(b, hrect);
+                using (Pen p = new Pen(Color.FromArgb(210, 235, 240, 245), 1.5f))
+                    g.DrawRectangle(p, hrect.X, hrect.Y, hrect.Width, hrect.Height);
+            }
+
+            // Origin marker
+            float ox = PanOffset.X * Zoom + cx;
+            float oy = PanOffset.Y * Zoom + cy;
+            using (Brush b = new SolidBrush(Color.FromArgb(220, 255, 140, 50)))
+                g.FillEllipse(b, ox - 4, oy - 4, 8, 8);
+        }
+
+        private void DrawLayer(Graphics g, Dictionary<Point, string> layer, int startX, int endX, int startY, int endY, bool politics)
+        {
+            foreach (var kvp in layer)
+            {
+                Point cell = kvp.Key;
+                if (cell.X < startX || cell.X > endX || cell.Y < startY || cell.Y > endY) continue;
+                BlockDef def;
+                if (!BlockDefs.TryGetValue(kvp.Value, out def)) continue;
+                RectangleF rect = CellToScreenRect(cell);
+                if (!string.IsNullOrEmpty(def.Symbol)) continue;
+                bool overlay = politics && ShowLandscapeLayer && _landscapeLayer.Cells.ContainsKey(cell);
+                if (!overlay)
+                {
+                    using (Brush brush = new SolidBrush(def.Color))
+                        g.FillRectangle(brush, rect);
+                }
+                using (Pen pen = new Pen(overlay ? def.Color : def.BorderColor, overlay ? 2f : 1f))
+                    g.DrawRectangle(pen, rect.X, rect.Y, rect.Width, rect.Height);
+                if (overlay && string.IsNullOrEmpty(def.Symbol))
+                {
+                    using (Brush swatch = new SolidBrush(def.Color))
+                        g.FillRectangle(swatch, rect.X + 3f, rect.Y + 3f, Math.Min(6f, rect.Width * 0.2f), Math.Min(6f, rect.Height * 0.2f));
+                }
+            }
+        }
+
+        private void DrawObjectLabels(Graphics g, Dictionary<Point, string> layer, int startX, int endX, int startY, int endY)
+        {
+            foreach (var kvp in layer)
+            {
+                Point cell = kvp.Key;
+                if (cell.X < startX || cell.X > endX || cell.Y < startY || cell.Y > endY) continue;
+                BlockDef def;
+                if (!BlockDefs.TryGetValue(kvp.Value, out def) || string.IsNullOrEmpty(def.Symbol)) continue;
+                RectangleF rect = CellToScreenRect(cell);
+                if (rect.Width < 14f) continue;
+                using (Font font = new Font("Segoe UI", Math.Max(8f, Math.Min(13f, rect.Width * 0.42f)), FontStyle.Bold))
+                using (Brush ink = new SolidBrush(Color.White))
+                using (StringFormat align = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                    g.DrawString(def.Symbol, font, ink, rect, align);
+            }
+        }
+
+        private void DrawPreviewSymbol(Graphics g, string id, Point cell)
+        {
+            RectangleF rect = CellToScreenRect(cell);
+            if (rect.Width < 14f) return;
+            using (Font font = new Font("Segoe UI", Math.Max(8f, Math.Min(13f, rect.Width * 0.42f)), FontStyle.Bold))
+            using (Brush ink = new SolidBrush(Color.FromArgb(180, Color.White)))
+            using (StringFormat align = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                g.DrawString(BlockDefs[id].Symbol, font, ink, rect, align);
+        }
+
+        public string ExportJson()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("{");
+            sb.AppendLine("  \"format\": \"pixel_architect_v1\",");
+            sb.AppendLine(string.Format("  \"map_kind\": \"{0}\",", MapKind));
+            sb.AppendLine(string.Format("  \"map_size\": [{0}, {1}],", MapWidth, MapHeight));
+            sb.AppendLine(string.Format("  \"created_at\": \"{0}\",", DateTime.UtcNow.ToString("s")));
+            sb.AppendLine(string.Format("  \"total_blocks\": {0},", TotalBlockCount));
+            sb.AppendLine(string.Format("  \"active_layer\": \"{0}\",", ActiveLayer));
+            sb.AppendLine(string.Format("  \"visibility\": {{ \"political\": {0}, \"landscape\": {1} }},",
+                ShowPoliticalLayer.ToString().ToLowerInvariant(), ShowLandscapeLayer.ToString().ToLowerInvariant()));
+            sb.AppendLine("  \"layers\": {");
+            AppendCellObject(sb, "political", _politicalLayer.Cells, true);
+            AppendCellObject(sb, "landscape", _landscapeLayer.Cells, true);
+            AppendCellObject(sb, "objects", _objectLayer.Cells, false);
+            sb.AppendLine("  },");
+            // The legacy field stays last so older PixelBuilder versions can read the selected layer.
+            AppendCellObject(sb, "blocks", Cells, false);
+            sb.AppendLine("}");
+            return sb.ToString();
+        }
+
+        private static void AppendCellObject(StringBuilder sb, string name, Dictionary<Point, string> cells, bool comma)
+        {
+            sb.AppendLine(string.Format("    \"{0}\": {{", name));
+            int count = 0;
+            foreach (var kvp in cells)
+            {
+                count++;
+                sb.AppendLine(string.Format("      \"{0},{1}\": \"{2}\"{3}", kvp.Key.X, kvp.Key.Y,
+                    kvp.Value, count < cells.Count ? "," : ""));
+            }
+            sb.AppendLine(comma ? "    }," : "    }");
+        }
+
+        public bool ImportJson(string json)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(json)) return false;
+                var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var root = serializer.DeserializeObject(json) as Dictionary<string, object>;
+                if (root == null || !root.ContainsKey("format") || (string)root["format"] != "pixel_architect_v1") return false;
+                if (root.ContainsKey("map_kind") && (string)root["map_kind"] != MapKind) return false;
+                var size = root.ContainsKey("map_size") ? root["map_size"] as object[] : null;
+                if (size == null || size.Length != 2) return false;
+                var entries = root.ContainsKey("blocks") ? root["blocks"] as Dictionary<string, object> : null;
+                var layers = root.ContainsKey("layers") ? root["layers"] as Dictionary<string, object> : null;
+                if (entries == null && layers == null) return false;
+                int offsetX = 0, offsetY = 0;
+                if (Convert.ToInt32(size[0]) != MapWidth || Convert.ToInt32(size[1]) != MapHeight)
+                {
+                    // Earlier 184-cell exports used the fixed 1000x1000 editor canvas.
+                    var metadata = root.ContainsKey("global_map") ? root["global_map"] as Dictionary<string, object> : null;
+                    var grid = metadata != null && metadata.ContainsKey("grid_size") ? metadata["grid_size"] as object[] : null;
+                    var offset = metadata != null && metadata.ContainsKey("editor_offset") ? metadata["editor_offset"] as object[] : null;
+                    if (MapKind != "global" || grid == null || offset == null || grid.Length != 2 || offset.Length != 2 ||
+                        Convert.ToInt32(grid[0]) != MapWidth || Convert.ToInt32(grid[1]) != MapHeight) return false;
+                    offsetX = Convert.ToInt32(offset[0]);
+                    offsetY = Convert.ToInt32(offset[1]);
+                }
+                Dictionary<Point, string> politics, landscape, objects;
+                if (layers != null)
+                {
+                    var politicalEntries = layers.ContainsKey("political") ? layers["political"] as Dictionary<string, object> : null;
+                    var landscapeEntries = layers.ContainsKey("landscape") ? layers["landscape"] as Dictionary<string, object> : null;
+                    var objectEntries = layers.ContainsKey("objects") ? layers["objects"] as Dictionary<string, object> : null;
+                    if (!TryDecodeCells(politicalEntries, offsetX, offsetY, out politics) ||
+                        !TryDecodeCells(landscapeEntries, offsetX, offsetY, out landscape)) return false;
+                    if (objectEntries != null)
+                    {
+                        if (!TryDecodeCells(objectEntries, offsetX, offsetY, out objects)) return false;
+                        foreach (string id in objects.Values) if (!IsObject(id)) return false;
+                    }
+                    else objects = new Dictionary<Point, string>();
+                }
+                else
+                {
+                    Dictionary<Point, string> decoded;
+                    if (!TryDecodeCells(entries, offsetX, offsetY, out decoded)) return false;
+                    string targetLayer = ActiveLayer;
+                    var metadata = root.ContainsKey("global_map") ? root["global_map"] as Dictionary<string, object> : null;
+                    var oldCells = metadata != null && metadata.ContainsKey("cells") ? metadata["cells"] as object[] : null;
+                    if (oldCells != null && oldCells.Length > 0)
+                    {
+                        var first = oldCells[0] as Dictionary<string, object>;
+                        if (first != null && first.ContainsKey("marker")) targetLayer = "political";
+                        else if (first != null && first.ContainsKey("nature_marker")) targetLayer = "landscape";
+                    }
+                    politics = targetLayer == "political" ? decoded : new Dictionary<Point, string>(_politicalLayer.Cells);
+                    landscape = targetLayer == "landscape" ? decoded : new Dictionary<Point, string>(_landscapeLayer.Cells);
+                    objects = new Dictionary<Point, string>(_objectLayer.Cells);
+                    SetActiveLayer(targetLayer);
+                }
+
+                // Migrate labels saved inside a color layer by older versions.
+                foreach (var layer in new[] { politics, landscape })
+                    foreach (var item in new List<KeyValuePair<Point, string>>(layer))
+                        if (IsObject(item.Value))
+                        {
+                            if (!objects.ContainsKey(item.Key)) objects[item.Key] = item.Value;
+                            layer.Remove(item.Key);
+                        }
+
+                // Commit only after successful validation.
+                _politicalLayer.Cells = politics;
+                _landscapeLayer.Cells = landscape;
+                _objectLayer.Cells = objects;
+                foreach (MapLayer layer in new[] { _politicalLayer, _landscapeLayer, _objectLayer })
+                {
+                    layer.Undo.Clear(); layer.Redo.Clear(); layer.Stroke.Clear();
+                }
+                if (root.ContainsKey("active_layer")) SetActiveLayer(root["active_layer"] as string);
+                var visibility = root.ContainsKey("visibility") ? root["visibility"] as Dictionary<string, object> : null;
+                if (visibility != null)
+                {
+                    if (visibility.ContainsKey("political")) ShowPoliticalLayer = Convert.ToBoolean(visibility["political"]);
+                    if (visibility.ContainsKey("landscape")) ShowLandscapeLayer = Convert.ToBoolean(visibility["landscape"]);
+                }
+                ClearSelection();
+
+                if (HistoryChanged != null) HistoryChanged();
+                NotifyStats();
+                Invalidate();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool TryDecodeCells(Dictionary<string, object> entries, int offsetX, int offsetY,
+            out Dictionary<Point, string> decoded)
+        {
+            decoded = new Dictionary<Point, string>();
+            if (entries == null) return false;
+            foreach (var entry in entries)
+            {
+                string[] coords = entry.Key.Split(',');
+                int x, y;
+                if (coords.Length != 2 || !int.TryParse(coords[0], out x) || !int.TryParse(coords[1], out y)) return false;
+                Point point = new Point(x - offsetX, y - offsetY);
+                string blockId = entry.Value as string;
+                if (blockId == null || !IsInMap(point) || !EnsureColorId(blockId)) return false;
+                if (MapKind == "global" && blockId.StartsWith("building_")) return false;
+                if (MapKind == "local" && blockId.StartsWith("settlement_")) return false;
+                if (decoded.ContainsKey(point)) return false;
+                decoded.Add(point, blockId);
+            }
+            return true;
+        }
+    }
+
+    public class MainForm : Form
+    {
+        private CanvasControl _canvas;
+        private CanvasControl _globalCanvas;
+        private CanvasControl _localCanvas;
+        private TabControl _mapTabs;
+        private Label _lblStatus;
+        private Label _lblCoords;
+        private Label _lblActiveBlock;
+        private Button _btnUndo;
+        private Button _btnRedo;
+        private Button _btnGrid;
+        private Button _btnCenter;
+        private Button _btnCut;
+        private Button _btnCopy;
+        private Button _btnPaste;
+        private Button _btnDeleteSel;
+        private readonly Dictionary<string, Button> _paletteBtns = new Dictionary<string, Button>();
+        private readonly Dictionary<ToolMode, Button> _toolBtns = new Dictionary<ToolMode, Button>();
+        private Label _modeHeading;
+        private Label _objectsHeading;
+        private FlowLayoutPanel _objectPanel;
+        private Button _politicsButton;
+        private Button _landscapeButton;
+        private CheckBox _showPolitics;
+        private CheckBox _showLandscape;
+        private readonly Timer _wasdTimer = new Timer();
+        private readonly HashSet<Keys> _pressedKeys = new HashSet<Keys>();
+
+        public MainForm()
+        {
+            Text = "Pixel Architect [Map: 1000 x 1000]";
+            Size = new Size(1380, 860);
+            MinimumSize = new Size(950, 550);
+            StartPosition = FormStartPosition.CenterScreen;
+            BackColor = Color.FromArgb(14, 15, 18);
+            ForeColor = Color.White;
+            KeyPreview = true;
+
+            InitializeUI();
+            SetupWasdTimer();
+        }
+
+        private void SetupWasdTimer()
+        {
+            _wasdTimer.Interval = 16;
+            _wasdTimer.Tick += (s, e) =>
+            {
+                float speed = 14f;
+                float dx = 0, dy = 0;
+                if (_pressedKeys.Contains(Keys.W) || _pressedKeys.Contains(Keys.Up)) dy += speed;
+                if (_pressedKeys.Contains(Keys.S) || _pressedKeys.Contains(Keys.Down)) dy -= speed;
+                if (_pressedKeys.Contains(Keys.A) || _pressedKeys.Contains(Keys.Left)) dx += speed;
+                if (_pressedKeys.Contains(Keys.D) || _pressedKeys.Contains(Keys.Right)) dx -= speed;
+
+                if (dx != 0 || dy != 0)
+                {
+                    _canvas.MoveCamera(dx, dy);
+                }
+            };
+            _wasdTimer.Start();
+        }
+
+        private void InitializeUI()
+        {
+            // --- Clean 2-Row Ribbon on Top (Height: 74px) ---
+            Panel pnlTop = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 74,
+                BackColor = Color.FromArgb(22, 24, 30),
+                Padding = new Padding(8, 4, 8, 4)
+            };
+
+            // ================= ROW 1 (Tools, Scissors, History, Center, Stats) =================
+            int r1Y = 7;
+            int x1 = 8;
+
+            AddToolBtn(pnlTop, "Pencil [B]", ToolMode.Brush, r1Y, ref x1);
+            AddToolBtn(pnlTop, "Line [L]", ToolMode.Line, r1Y, ref x1);
+            AddToolBtn(pnlTop, "Rect [R]", ToolMode.Rect, r1Y, ref x1);
+            AddToolBtn(pnlTop, "Fill [F]", ToolMode.Fill, r1Y, ref x1);
+            AddToolBtn(pnlTop, "Eraser [E]", ToolMode.Eraser, r1Y, ref x1);
+
+            AddSep(pnlTop, r1Y, ref x1);
+
+            AddToolBtn(pnlTop, "✂ Select [S]", ToolMode.Select, r1Y, ref x1);
+
+            _btnCut = AddCompactBtn(pnlTop, "Cut [Ctrl+X]", r1Y, ref x1, () => _canvas.CutSelection());
+            _btnCut.BackColor = Color.FromArgb(42, 34, 48);
+            _btnCut.ForeColor = Color.FromArgb(235, 170, 240);
+            _btnCut.FlatAppearance.BorderColor = Color.FromArgb(90, 60, 110);
+            _btnCut.Enabled = false;
+
+            _btnCopy = AddCompactBtn(pnlTop, "Copy [Ctrl+C]", r1Y, ref x1, () =>
+            {
+                if (_canvas.HasSelection)
+                {
+                    _canvas.CopySelection();
+                    _btnPaste.Enabled = true;
+                    MessageBox.Show(string.Format("Copied {0} blocks to stamp buffer!\nClick Paste [Ctrl+V] to place them anywhere.", _canvas.ClipboardBuffer.Count), "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    Clipboard.SetText(_canvas.ExportJson());
+                    MessageBox.Show("Blueprint JSON copied to Windows Clipboard!", "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            });
+
+            _btnPaste = AddCompactBtn(pnlTop, "📋 Paste [Ctrl+V]", r1Y, ref x1, () => _canvas.StartPaste());
+            _btnPaste.BackColor = Color.FromArgb(34, 48, 42);
+            _btnPaste.ForeColor = Color.FromArgb(170, 240, 195);
+            _btnPaste.FlatAppearance.BorderColor = Color.FromArgb(60, 110, 85);
+            _btnPaste.Enabled = false;
+
+            _btnDeleteSel = AddCompactBtn(pnlTop, "Del", r1Y, ref x1, () => _canvas.DeleteSelection());
+            _btnDeleteSel.Enabled = false;
+
+            AddSep(pnlTop, r1Y, ref x1);
+
+            _btnUndo = AddCompactBtn(pnlTop, "↶ Undo", r1Y, ref x1, () => _canvas.Undo());
+            _btnRedo = AddCompactBtn(pnlTop, "↷ Redo", r1Y, ref x1, () => _canvas.Redo());
+            _btnUndo.Enabled = false;
+            _btnRedo.Enabled = false;
+
+            AddCompactBtn(pnlTop, "Clear layer", r1Y, ref x1, () => _canvas.ClearAll());
+
+            // Coordinates Badge (Row 1, Right Aligned)
+            Panel pnlStats = new Panel
+            {
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Size = new Size(320, 28),
+                Location = new Point(Width - 336, 6),
+                BackColor = Color.FromArgb(16, 17, 21)
+            };
+
+            _lblCoords = new Label
+            {
+                Text = "X: 500  Y: 500",
+                Font = new Font("Consolas", 10.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(250, 215, 80),
+                AutoSize = true,
+                Location = new Point(8, 5)
+            };
+            pnlStats.Controls.Add(_lblCoords);
+
+            _lblStatus = new Label
+            {
+                Text = "1000x1000 | 0 blk | 50%",
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = Color.FromArgb(150, 160, 180),
+                AutoSize = true,
+                Location = new Point(145, 6)
+            };
+            pnlStats.Controls.Add(_lblStatus);
+            pnlTop.Controls.Add(pnlStats);
+
+            // ================= ROW 2 (Palette, Grid, Center, File Save/Open/PNG/Copy) =================
+            int r2Y = 40;
+            int x2 = 8;
+
+            // Palette Swatches
+            ToolTip tip = new ToolTip();
+            foreach (var def in CanvasControl.Palette)
+            {
+                Button pbtn = new Button
+                {
+                    Size = new Size(25, 25),
+                    Location = new Point(x2, r2Y + 1),
+                    FlatStyle = FlatStyle.Flat,
+                    BackColor = def.Color,
+                    Text = ""
+                };
+                pbtn.FlatAppearance.BorderColor = def.BorderColor;
+                pbtn.FlatAppearance.BorderSize = 1;
+                tip.SetToolTip(pbtn, string.Format("[{0}] {1}", def.Hotkey, def.Name));
+
+                string bid = def.Id;
+                pbtn.Click += (s, e) => SelectBlock(bid);
+                pnlTop.Controls.Add(pbtn);
+                _paletteBtns[bid] = pbtn;
+                x2 += 28;
+            }
+
+            _lblActiveBlock = new Label
+            {
+                Text = "Stone Wall [1]",
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(220, 225, 235),
+                AutoSize = true,
+                Location = new Point(x2 + 4, r2Y + 5)
+            };
+            pnlTop.Controls.Add(_lblActiveBlock);
+            x2 += 120;
+
+            AddSep(pnlTop, r2Y, ref x2);
+
+            // Grid & Center
+            _btnGrid = new Button
+            {
+                Text = "Grid [G]",
+                Size = new Size(62, 26),
+                Location = new Point(x2, r2Y),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(45, 60, 85),
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
+            };
+            _btnGrid.FlatAppearance.BorderColor = Color.FromArgb(90, 130, 190);
+            _btnGrid.Click += (s, e) => ToggleGrid();
+            pnlTop.Controls.Add(_btnGrid);
+            x2 += 68;
+
+            _btnCenter = AddCompactBtn(pnlTop, "⌖ Center", r2Y, ref x2, () => _canvas.CenterOnMap());
+            _btnCenter.BackColor = Color.FromArgb(40, 55, 80);
+            _btnCenter.ForeColor = Color.FromArgb(240, 210, 80);
+            _btnCenter.FlatAppearance.BorderColor = Color.FromArgb(90, 140, 210);
+
+            AddSep(pnlTop, r2Y, ref x2);
+
+            // FILE OPERATIONS (Prominent, Always Visible in Row 2)
+            Button btnSave = AddCompactBtn(pnlTop, "💾 Save JSON [Ctrl+S]", r2Y, ref x2, () => SaveJsonToFile());
+            btnSave.BackColor = Color.FromArgb(32, 48, 38);
+            btnSave.ForeColor = Color.FromArgb(170, 240, 190);
+            btnSave.FlatAppearance.BorderColor = Color.FromArgb(50, 110, 75);
+
+            Button btnOpen = AddCompactBtn(pnlTop, "📂 Open JSON [Ctrl+O]", r2Y, ref x2, () => OpenJsonFromFile());
+            btnOpen.BackColor = Color.FromArgb(32, 42, 54);
+            btnOpen.ForeColor = Color.FromArgb(175, 210, 255);
+            btnOpen.FlatAppearance.BorderColor = Color.FromArgb(60, 95, 140);
+
+            Button btnPng = AddCompactBtn(pnlTop, "🖼 Export PNG", r2Y, ref x2, () => SavePngImage());
+            btnPng.BackColor = Color.FromArgb(44, 38, 30);
+            btnPng.ForeColor = Color.FromArgb(250, 210, 140);
+            btnPng.FlatAppearance.BorderColor = Color.FromArgb(110, 85, 45);
+
+            AddCompactBtn(pnlTop, "📋 Copy JSON", r2Y, ref x2, () =>
+            {
+                Clipboard.SetText(_canvas.ExportJson());
+                MessageBox.Show("Blueprint JSON copied to Clipboard!\nReady to paste into MiniLife or text files.", "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            });
+
+            Panel sidebar = new Panel { Dock = DockStyle.Right, Width = 310,
+                BackColor = Color.FromArgb(24, 27, 34), Padding = new Padding(8) };
+            FlowLayoutPanel colors = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true,
+                WrapContents = true, FlowDirection = FlowDirection.LeftToRight,
+                BackColor = Color.FromArgb(24, 27, 34) };
+            foreach (BlockDef def in CanvasControl.ColorPalette)
+            {
+                Button swatch = new Button { Size = new Size(27, 27), Margin = new Padding(2, 3, 2, 2),
+                    FlatStyle = FlatStyle.Flat, BackColor = def.Color };
+                swatch.FlatAppearance.BorderColor = def.BorderColor;
+                tip.SetToolTip(swatch, def.Name);
+                string colorId = def.Id;
+                swatch.Click += (s, e) => { SelectBlock(colorId); SelectTool(ToolMode.Brush); };
+                colors.Controls.Add(swatch);
+                _paletteBtns[colorId] = swatch;
+            }
+            Button customColor = new Button { Text = "Свой цвет...", AutoSize = true, Height = 26,
+                Margin = new Padding(7, 2, 2, 2), FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(44, 48, 58), ForeColor = Color.White };
+            customColor.Click += (s, e) =>
+            {
+                using (ColorDialog dialog = new ColorDialog { FullOpen = true, AnyColor = true })
+                {
+                    if (dialog.ShowDialog() == DialogResult.OK)
+                    {
+                        SelectBlock(CanvasControl.RegisterColor(dialog.Color).Id);
+                        SelectTool(ToolMode.Brush);
+                    }
+                }
+            };
+            colors.Controls.Add(customColor);
+
+            Label colorsHeading = new Label { Text = "Цвета — 72 оттенка + свой", Dock = DockStyle.Top,
+                Height = 28, ForeColor = Color.White, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
+            _objectsHeading = new Label { Dock = DockStyle.Top, Height = 28,
+                ForeColor = Color.White, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
+            _objectPanel = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 190,
+                AutoScroll = true, WrapContents = true, BackColor = Color.FromArgb(24, 27, 34) };
+            TableLayoutPanel layerPanel = new TableLayoutPanel { Dock = DockStyle.Top, Height = 74,
+                ColumnCount = 2, RowCount = 2, BackColor = Color.FromArgb(30, 33, 40) };
+            layerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+            layerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+            layerPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));
+            layerPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 38f));
+            _politicsButton = new Button { Text = "Политика", Dock = DockStyle.Fill };
+            _landscapeButton = new Button { Text = "Ландшафт", Dock = DockStyle.Fill };
+            _showPolitics = new CheckBox { Text = "Показать", Dock = DockStyle.Fill, ForeColor = Color.White };
+            _showLandscape = new CheckBox { Text = "Показать", Dock = DockStyle.Fill, ForeColor = Color.White };
+            _politicsButton.Click += (s, e) => { _canvas.SetActiveLayer("political"); RefreshSidebar(); };
+            _landscapeButton.Click += (s, e) => { _canvas.SetActiveLayer("landscape"); RefreshSidebar(); };
+            _showPolitics.CheckedChanged += (s, e) => { _canvas.ShowPoliticalLayer = _showPolitics.Checked; _canvas.Invalidate(); };
+            _showLandscape.CheckedChanged += (s, e) => { _canvas.ShowLandscapeLayer = _showLandscape.Checked; _canvas.Invalidate(); };
+            layerPanel.Controls.Add(_politicsButton, 0, 0);
+            layerPanel.Controls.Add(_landscapeButton, 1, 0);
+            layerPanel.Controls.Add(_showPolitics, 0, 1);
+            layerPanel.Controls.Add(_showLandscape, 1, 1);
+            _modeHeading = new Label { Dock = DockStyle.Top, Height = 48,
+                ForeColor = Color.White, Font = new Font("Segoe UI", 12f, FontStyle.Bold) };
+            sidebar.Controls.Add(colors);
+            sidebar.Controls.Add(colorsHeading);
+            sidebar.Controls.Add(_objectPanel);
+            sidebar.Controls.Add(_objectsHeading);
+            sidebar.Controls.Add(layerPanel);
+            sidebar.Controls.Add(_modeHeading);
+
+            _mapTabs = new TabControl { Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                SizeMode = TabSizeMode.Fixed, ItemSize = new Size(225, 32) };
+            _globalCanvas = new CanvasControl("global", 21, 15) { Dock = DockStyle.Fill };
+            _localCanvas = new CanvasControl("local", 1000, 1000) { Dock = DockStyle.Fill };
+            AddMapPage("Глобальная карта", _globalCanvas);
+            AddMapPage("Локальная карта", _localCanvas);
+            WireCanvas(_globalCanvas);
+            WireCanvas(_localCanvas);
+            _canvas = _globalCanvas;
+            _mapTabs.SelectedIndexChanged += (s, e) =>
+            {
+                _canvas = _mapTabs.SelectedIndex == 0 ? _globalCanvas : _localCanvas;
+                Text = "Pixel Architect [" + (_canvas.MapKind == "global" ? "Глобальная 21 × 15" : "Локальная 1000 × 1000") + "]";
+                _btnCenter.Text = _canvas.MapKind == "global" ? "⌖ Center [10,7]" : "⌖ Center [500,500]";
+                _lblStatus.Text = string.Format("{0}x{1} | {2} blk | {3}%", _canvas.MapWidth, _canvas.MapHeight,
+                    _canvas.TotalBlockCount, (int)(_canvas.Zoom * 100));
+                RefreshSidebar();
+                SelectBlock(_canvas.ActiveBlockId);
+                _btnUndo.Enabled = _canvas.CanUndo;
+                _btnRedo.Enabled = _canvas.CanRedo;
+                _btnCut.Enabled = _canvas.HasSelection;
+                _btnDeleteSel.Enabled = _canvas.HasSelection;
+                _canvas.Focus();
+            };
+            Controls.Add(_mapTabs);
+            Controls.Add(sidebar);
+            Controls.Add(pnlTop);
+
+            SelectBlock("stone_wall");
+            SelectTool(ToolMode.Brush);
+            Text = "Pixel Architect [Глобальная 21 × 15]";
+            _btnCenter.Text = "⌖ Center [10,7]";
+            RefreshSidebar();
+        }
+
+        private void AddMapPage(string title, CanvasControl canvas)
+        {
+            TabPage page = new TabPage(title) { BackColor = Color.FromArgb(22, 24, 30) };
+            page.Controls.Add(canvas);
+            _mapTabs.TabPages.Add(page);
+        }
+
+        private void RefreshSidebar()
+        {
+            bool global = _canvas.MapKind == "global";
+            _modeHeading.Text = global ? "Глобальная карта\n21 × 15 клеток" : "Локальная карта\n1000 × 1000 клеток";
+            _objectsHeading.Text = global ? "Поселения (1 × 1)" : "Жильё (1 × 1)";
+            _politicsButton.BackColor = _canvas.ActiveLayer == "political" ? Color.FromArgb(70, 85, 115) : Color.FromArgb(40, 44, 53);
+            _landscapeButton.BackColor = _canvas.ActiveLayer == "landscape" ? Color.FromArgb(70, 85, 115) : Color.FromArgb(40, 44, 53);
+            _showPolitics.Checked = _canvas.ShowPoliticalLayer;
+            _showLandscape.Checked = _canvas.ShowLandscapeLayer;
+            while (_objectPanel.Controls.Count > 0)
+            {
+                Control old = _objectPanel.Controls[0];
+                _paletteBtns.Remove(old.Name);
+                _objectPanel.Controls.RemoveAt(0);
+                old.Dispose();
+            }
+            foreach (BlockDef def in global ? CanvasControl.GlobalObjects : CanvasControl.LocalObjects)
+            {
+                Button button = new Button { Name = def.Id, Text = def.Name, Width = 132, Height = 32,
+                    Margin = new Padding(3), FlatStyle = FlatStyle.Flat,
+                    BackColor = def.Color, ForeColor = Color.White };
+                button.FlatAppearance.BorderColor = def.BorderColor;
+                string objectId = def.Id;
+                button.Click += (s, e) => { SelectBlock(objectId); SelectTool(ToolMode.Brush); };
+                _objectPanel.Controls.Add(button);
+                _paletteBtns[objectId] = button;
+            }
+            SelectBlock(_canvas.ActiveBlockId);
+        }
+
+        private void WireCanvas(CanvasControl canvas)
+        {
+            canvas.HoverChanged += (pt, bid, isValid) =>
+            {
+                if (canvas != _canvas) return;
+                if (isValid)
+                {
+                    _lblCoords.Text = string.Format("X: {0}  Y: {1}", pt.X, pt.Y);
+                    _lblCoords.ForeColor = Color.FromArgb(250, 215, 80);
+                }
+                else
+                {
+                    _lblCoords.Text = "OUT OF MAP";
+                    _lblCoords.ForeColor = Color.FromArgb(220, 80, 80);
+                }
+            };
+            canvas.StatsChanged += (blocks, zoom) =>
+            {
+                if (canvas == _canvas)
+                    _lblStatus.Text = string.Format("{0}x{1} | {2} blk | {3}%", canvas.MapWidth, canvas.MapHeight, blocks, zoom);
+            };
+            canvas.HistoryChanged += () =>
+            {
+                if (canvas == _canvas) { _btnUndo.Enabled = canvas.CanUndo; _btnRedo.Enabled = canvas.CanRedo; }
+            };
+            canvas.SelectionChanged += () =>
+            {
+                if (canvas == _canvas) { _btnCut.Enabled = canvas.HasSelection; _btnDeleteSel.Enabled = canvas.HasSelection; }
+            };
+        }
+
+        private void AddSep(Panel pnl, int y, ref int x)
+        {
+            Label sep = new Label
+            {
+                Text = "|",
+                ForeColor = Color.FromArgb(48, 52, 64),
+                Font = new Font("Segoe UI", 11f),
+                AutoSize = true,
+                Location = new Point(x, y)
+            };
+            pnl.Controls.Add(sep);
+            x += 14;
+        }
+
+        private void AddToolBtn(Panel pnl, string text, ToolMode mode, int y, ref int x)
+        {
+            Button btn = new Button
+            {
+                Text = text,
+                AutoSize = true,
+                Height = 26,
+                Location = new Point(x, y),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(34, 38, 48),
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 8.5f)
+            };
+            btn.FlatAppearance.BorderColor = Color.FromArgb(58, 66, 82);
+            btn.Click += (s, e) => SelectTool(mode);
+            pnl.Controls.Add(btn);
+            _toolBtns[mode] = btn;
+            x += btn.Width + 4;
+        }
+
+        private Button AddCompactBtn(Panel pnl, string text, int y, ref int x, Action act)
+        {
+            Button btn = new Button
+            {
+                Text = text,
+                AutoSize = true,
+                Height = 26,
+                Location = new Point(x, y),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(32, 36, 46),
+                ForeColor = Color.FromArgb(215, 222, 235),
+                Font = new Font("Segoe UI", 8.5f)
+            };
+            btn.FlatAppearance.BorderColor = Color.FromArgb(52, 60, 75);
+            btn.Click += (s, e) => act();
+            pnl.Controls.Add(btn);
+            x += btn.Width + 4;
+            return btn;
+        }
+
+        private void ToggleGrid()
+        {
+            _canvas.ShowGrid = !_canvas.ShowGrid;
+            _btnGrid.BackColor = _canvas.ShowGrid ? Color.FromArgb(45, 60, 85) : Color.FromArgb(32, 36, 46);
+            _btnGrid.FlatAppearance.BorderColor = _canvas.ShowGrid ? Color.FromArgb(90, 130, 190) : Color.FromArgb(52, 60, 75);
+            _canvas.Invalidate();
+        }
+
+        private void SelectTool(ToolMode mode)
+        {
+            _canvas.CurrentTool = mode;
+            if (mode != ToolMode.Select && _canvas.HasSelection)
+            {
+                _canvas.ClearSelection();
+            }
+            foreach (var kvp in _toolBtns)
+            {
+                kvp.Value.BackColor = (kvp.Key == mode) ? Color.FromArgb(70, 85, 115) : Color.FromArgb(32, 36, 46);
+                kvp.Value.FlatAppearance.BorderColor = (kvp.Key == mode) ? Color.FromArgb(140, 175, 230) : Color.FromArgb(52, 60, 75);
+            }
+        }
+
+        private void SelectBlock(string bid)
+        {
+            _canvas.ActiveBlockId = bid;
+            _canvas.RefreshEditingLayer();
+            if (CanvasControl.BlockDefs.ContainsKey(bid))
+            {
+                var def = CanvasControl.BlockDefs[bid];
+                _lblActiveBlock.Text = string.IsNullOrEmpty(def.Hotkey) ? def.Name : string.Format("{0} [{1}]", def.Name, def.Hotkey);
+            }
+            foreach (var kvp in _paletteBtns)
+            {
+                bool isSel = (kvp.Key == bid);
+                kvp.Value.FlatAppearance.BorderSize = isSel ? 3 : 1;
+                kvp.Value.FlatAppearance.BorderColor = isSel ? Color.FromArgb(255, 220, 80) : CanvasControl.BlockDefs[kvp.Key].BorderColor;
+            }
+        }
+
+        private void SaveJsonToFile()
+        {
+            using (SaveFileDialog sfd = new SaveFileDialog())
+            {
+                sfd.Filter = "Blueprint JSON (*.json)|*.json";
+                sfd.FileName = string.Format("{0}_{1}.json", _canvas.MapKind, DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+                if (sfd.ShowDialog() == DialogResult.OK)
+                {
+                    File.WriteAllText(sfd.FileName, _canvas.ExportJson(), Encoding.UTF8);
+                    MessageBox.Show("Saved successfully:\n" + sfd.FileName, "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+        }
+
+        private void OpenJsonFromFile()
+        {
+            using (OpenFileDialog ofd = new OpenFileDialog())
+            {
+                ofd.Filter = "Blueprint JSON (*.json)|*.json";
+                if (ofd.ShowDialog() == DialogResult.OK)
+                {
+                    string text = File.ReadAllText(ofd.FileName, Encoding.UTF8);
+                    bool globalFile = System.Text.RegularExpressions.Regex.IsMatch(text,
+                        "\"map_kind\"\\s*:\\s*\"global\"|\"global_map\"\\s*:");
+                    CanvasControl target = globalFile ? _globalCanvas : _localCanvas;
+                    if (target.ImportJson(text))
+                    {
+                        _mapTabs.SelectedIndex = globalFile ? 0 : 1;
+                        RefreshSidebar();
+                        MessageBox.Show("Loaded successfully:\n" + ofd.FileName, "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    else
+                    {
+                        MessageBox.Show("Invalid blueprint JSON format.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                }
+            }
+        }
+
+        private void SavePngImage()
+        {
+            using (SaveFileDialog sfd = new SaveFileDialog())
+            {
+                sfd.Filter = "PNG Image (*.png)|*.png";
+                sfd.FileName = string.Format("blueprint_{0}.png", DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+                if (sfd.ShowDialog() == DialogResult.OK)
+                {
+                    using (Bitmap bmp = new Bitmap(_canvas.Width, _canvas.Height))
+                    {
+                        _canvas.DrawToBitmap(bmp, new Rectangle(0, 0, _canvas.Width, _canvas.Height));
+                        bmp.Save(sfd.FileName, ImageFormat.Png);
+                    }
+                    MessageBox.Show("Saved PNG image:\n" + sfd.FileName, "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            _pressedKeys.Add(e.KeyCode);
+
+            if (e.Control && e.KeyCode == Keys.Z) { _canvas.Undo(); e.Handled = true; return; }
+            if (e.Control && e.KeyCode == Keys.Y) { _canvas.Redo(); e.Handled = true; return; }
+            if (e.Control && e.KeyCode == Keys.X) { _canvas.CutSelection(); e.Handled = true; return; }
+            if (e.Control && e.KeyCode == Keys.C)
+            {
+                if (_canvas.HasSelection)
+                {
+                    _canvas.CopySelection();
+                    _btnPaste.Enabled = true;
+                    MessageBox.Show(string.Format("Copied {0} blocks to stamp buffer!\nClick Paste [Ctrl+V] to place them anywhere.", _canvas.ClipboardBuffer.Count), "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    Clipboard.SetText(_canvas.ExportJson());
+                    MessageBox.Show("Blueprint JSON copied to Windows Clipboard!", "Pixel Architect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                e.Handled = true;
+                return;
+            }
+            if (e.Control && e.KeyCode == Keys.V) { _canvas.StartPaste(); e.Handled = true; return; }
+            if (e.Control && e.KeyCode == Keys.S) { SaveJsonToFile(); e.Handled = true; return; }
+            if (e.Control && e.KeyCode == Keys.O) { OpenJsonFromFile(); e.Handled = true; return; }
+
+            if (e.KeyCode == Keys.Delete)
+            {
+                if (_canvas.HasSelection)
+                {
+                    _canvas.DeleteSelection();
+                    e.Handled = true;
+                    return;
+                }
+            }
+            if (e.KeyCode == Keys.Escape)
+            {
+                if (_canvas.CurrentTool == ToolMode.Paste)
+                {
+                    SelectTool(ToolMode.Brush);
+                }
+                if (_canvas.HasSelection)
+                {
+                    _canvas.ClearSelection();
+                }
+                e.Handled = true;
+                return;
+            }
+
+            switch (e.KeyCode)
+            {
+                case Keys.B: SelectTool(ToolMode.Brush); e.Handled = true; break;
+                case Keys.L: SelectTool(ToolMode.Line); e.Handled = true; break;
+                case Keys.R: SelectTool(ToolMode.Rect); e.Handled = true; break;
+                case Keys.F: SelectTool(ToolMode.Fill); e.Handled = true; break;
+                case Keys.E: SelectTool(ToolMode.Eraser); e.Handled = true; break;
+                case Keys.G: ToggleGrid(); e.Handled = true; break;
+                case Keys.Home: _canvas.CenterOnMap(); e.Handled = true; break;
+
+                case Keys.D1: case Keys.NumPad1: SelectBlock("stone_wall"); e.Handled = true; break;
+                case Keys.D2: case Keys.NumPad2: SelectBlock("wood_wall"); e.Handled = true; break;
+                case Keys.D3: case Keys.NumPad3: SelectBlock("wood_floor"); e.Handled = true; break;
+                case Keys.D4: case Keys.NumPad4: SelectBlock("stone_floor"); e.Handled = true; break;
+                case Keys.D5: case Keys.NumPad5: SelectBlock("door"); e.Handled = true; break;
+                case Keys.D6: case Keys.NumPad6: SelectBlock("water"); e.Handled = true; break;
+                case Keys.D7: case Keys.NumPad7: SelectBlock("dirt"); e.Handled = true; break;
+                case Keys.D8: case Keys.NumPad8: SelectBlock("pillar"); e.Handled = true; break;
+                case Keys.D9: case Keys.NumPad9: SelectBlock("grass"); e.Handled = true; break;
+                case Keys.D0: case Keys.NumPad0: SelectBlock("brick"); e.Handled = true; break;
+            }
+        }
+
+        protected override void OnKeyUp(KeyEventArgs e)
+        {
+            base.OnKeyUp(e);
+            _pressedKeys.Remove(e.KeyCode);
+        }
+
+        [STAThread]
+        static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
+        }
+    }
+}

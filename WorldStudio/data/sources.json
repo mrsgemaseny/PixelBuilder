@@ -1,0 +1,8 @@
+{
+  "note": "Основные карты автора. Импорт подставляет их сам; файлы только читаются. Смысл задаёт semantic, не цвет.",
+  "sources": [
+    { "semantic": "political", "path": "C:\\Users\\murat\\IdeaProjects\\new_world\\MiniLife\\future\\map\\Политическая карта с фракциями и зданиями.json" },
+    { "semantic": "landscape", "path": "C:\\Users\\murat\\IdeaProjects\\new_world\\MiniLife\\future\\map\\nature.json" },
+    { "semantic": "wildlands", "path": "C:\\Users\\murat\\IdeaProjects\\new_world\\MiniLife\\future\\map\\Д=деревни(пока что просто метки), г-имперские армии.json" }
+  ]
+}

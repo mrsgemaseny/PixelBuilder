@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "meta": {
+    "name": "MiniLife",
+    "created_at": "",
+    "updated_at": "",
+    "tool_version": ""
+  },
+  "grid": { "width": 21, "height": 15, "cell_tiles": 1000, "chunk_tiles": 16 },
+  "legend": {
+    "landscape_types": [
+      { "id": "plains", "name": "Равнины", "color": "51CC51" },
+      { "id": "forest", "name": "Лес", "color": "106B10" },
+      { "id": "mountains", "name": "Горы", "color": "383838" },
+      { "id": "sands", "name": "Пески", "color": "CC751E" }
+    ],
+    "legacy": {
+      "landscape_values": {
+        "color_51CC51": "plains",
+        "color_106B10": "forest",
+        "color_383838": "mountains",
+        "stone_wall": "mountains",
+        "color_CC751E": "sands"
+      },
+      "export_landscape": {
+        "plains": "color_51CC51",
+        "forest": "color_106B10",
+        "mountains": "color_383838",
+        "sands": "color_CC751E"
+      },
+      "owner_values": {
+        "color_CC1E1E": "state.reinhard",
+        "color_035BBC": "state.ortenverg",
+        "color_CC751E": "state.ulteria",
+        "color_51CC51": "state.askelia",
+        "color_CC51CC": "state.rosenwald",
+        "color_106B10": "state.kannararia",
+        "color_3D106B": "state.girdenburg",
+        "color_CCCC1E": "state.valden",
+        "color_6B3D10": "wild.group_1",
+        "color_6B5845": "wild.group_2",
+        "color_6B4A2A": "wild.group_3"
+      },
+      "political_objects": {
+        "settlement_castle": "castle",
+        "settlement_city": "city",
+        "settlement_fortress": "fortress",
+        "settlement_village": "village",
+        "settlement_village_2": "village_2",
+        "settlement_village_3": "village_3",
+        "independent_settlement": "village_mark",
+        "imperial_army": "army_mark"
+      },
+      "wildland_objects": {
+        "independent_settlement": "village_mark",
+        "imperial_army": "army_mark",
+        "settlement_village": "village_mark",
+        "settlement_city": "army_mark"
+      }
+    }
+  },
+  "entities": {
+    "states": [
+      { "id": "state.reinhard", "name": "Рейнгард", "kind": "kingdom", "ruler_placeholder": "имя", "color": "CC1E1E", "notes": "" },
+      { "id": "state.ortenverg", "name": "Ортенверг", "kind": "kingdom", "ruler_placeholder": "имя", "color": "035BBC", "notes": "" },
+      { "id": "state.ulteria", "name": "Ультерия", "kind": "kingdom", "ruler_placeholder": "имя", "color": "CC751E", "notes": "" },
+      { "id": "state.askelia", "name": "Аскелия", "kind": "duchy", "ruler_placeholder": "имя", "color": "51CC51", "notes": "" },
+      { "id": "state.rosenwald", "name": "Розенвальд", "kind": "duchy", "ruler_placeholder": "имя", "color": "CC51CC", "notes": "" },
+      { "id": "state.kannararia", "name": "Каннарария", "kind": "duchy", "ruler_placeholder": "имя", "color": "106B10", "notes": "" },
+      { "id": "state.girdenburg", "name": "Гирденбург", "kind": "county", "ruler_placeholder": "имя", "color": "3D106B", "notes": "" },
+      { "id": "state.valden", "name": "Вальден", "kind": "county", "ruler_placeholder": "имя", "color": "CCCC1E", "notes": "" }
+    ],
+    "wildlands": [
+      { "id": "wild.group_1", "color": "6B3D10", "notes": "независимые земли без официального лорда" },
+      { "id": "wild.group_2", "color": "6B5845", "notes": "независимые земли без официального лорда" },
+      { "id": "wild.group_3", "color": "6B4A2A", "notes": "независимые земли без официального лорда" }
+    ],
+    "armies": [
+      { "id": "army.west_1", "status": "roaming", "origin": null, "route": [], "position": { "x": 4, "y": 6 },
+        "notes": "ушла на запад; клетка - метка Г из файла диких земель; через Розенвальд или Ортенверг - неизвестно (I-04)" },
+      { "id": "army.west_2", "status": "roaming", "origin": null, "route": [], "position": { "x": 4, "y": 9 },
+        "notes": "ушла на запад; клетка - метка Г из файла диких земель; через Розенвальд или Ортенверг - неизвестно (I-04)" },
+      { "id": "army.south", "status": "roaming", "origin": null, "route": [], "position": { "x": 12, "y": 11 },
+        "notes": "ушла на юг; клетка - метка Г из файла диких земель" },
+      { "id": "army.east", "status": "roaming", "origin": null, "route": [], "position": { "x": 16, "y": 5 },
+        "notes": "ушла на восток вокруг земель Ультерии; клетка - метка Г из файла диких земель" },
+      { "id": "army.girdenburg", "status": "destroyed", "origin": null, "route": [], "position": null,
+        "notes": "самая короткая; разбита графом Гюнтером на землях Гирденбурга; клетка неизвестна (I-04)" }
+    ],
+    "retired_ids": []
+  },
+  "cells": [],
+  "objects": [],
+  "relations": {
+    "order": ["state.reinhard", "state.ortenverg", "state.ulteria", "state.askelia", "state.rosenwald", "state.kannararia", "state.girdenburg", "state.valden"],
+    "matrix": [
+      [null, -100, -100, -100, -60, -100, -80, -100],
+      [-80, null, -60, -15, 40, -100, 10, 0],
+      [-100, -100, null, -100, -80, -100, -80, -100],
+      [-100, -25, -100, null, -5, -100, 0, -35],
+      [-50, 55, -35, -10, null, -100, 80, -10],
+      [-100, -100, -100, -100, -100, null, -40, -60],
+      [-40, 30, -60, 0, 80, -90, null, 0],
+      [-100, 0, -100, -30, -20, -80, 0, null]
+    ]
+  },
+  "lore": { "timeline": [], "links": [] },
+  "buildings": {}
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "source": "таблица автора, промпт MINILIFE_WORLD_STUDIO_AGENT_PROMPT.md, раздел 5.6; у Ультерии 4 города по таблице автора (на карте 3)",
+  "rows": [
+    { "state": "state.reinhard", "castles": 3, "cities": 7, "villages": 31, "population": 3680 },
+    { "state": "state.ortenverg", "castles": 1, "cities": 6, "villages": 18, "population": 2490 },
+    { "state": "state.ulteria", "castles": 1, "cities": 4, "villages": 14, "population": 1810 },
+    { "state": "state.askelia", "castles": 1, "cities": 3, "villages": 10, "population": 1370 },
+    { "state": "state.rosenwald", "castles": 1, "cities": 2, "villages": 9, "population": 1080 },
+    { "state": "state.kannararia", "castles": 0, "cities": 2, "villages": 9, "population": 930 },
+    { "state": "state.girdenburg", "castles": 0, "cities": 1, "villages": 3, "population": 390 },
+    { "state": "state.valden", "castles": 1, "cities": 0, "villages": 4, "population": 350 }
+  ]
+}

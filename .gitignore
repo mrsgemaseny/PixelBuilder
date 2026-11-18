@@ -1,0 +1,8 @@
+# Сборка (build.cmd пишет сюда)
+bin/
+WorldStudio/bin/
+# Вывод тестов и проб
+tests/output/
+# Рабочие файлы WorldStudio рядом с миром
+*.autosave.json
+*.history/
