@@ -24,6 +24,17 @@ namespace MiniLife.WorldStudio.UI
 
         public static string TemplatePath { get { return Path.Combine(DataDir, "world_template.json"); } }
         public static string ReferencePath { get { return Path.Combine(DataDir, "settlements_reference.json"); } }
+        // Корень WorldStudio: папка над bin\ (exe лежит в bin), иначе папка exe.
+        public static string ProjectRoot
+        {
+            get
+            {
+                string exeDir = Path.GetDirectoryName(typeof(AppPaths).Assembly.Location);
+                return string.Equals(Path.GetFileName(exeDir), "bin", StringComparison.OrdinalIgnoreCase) ? Path.GetFullPath(Path.Combine(exeDir, "..")) : exeDir;
+            }
+        }
+
+        public static string WorldPath { get { return Path.Combine(ProjectRoot, "world.json"); } }
         public static string SourcesPath { get { return Path.Combine(DataDir, "sources.json"); } }
 
         public static string SettingsDir

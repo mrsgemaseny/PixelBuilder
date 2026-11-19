@@ -13,8 +13,8 @@ namespace MiniLife.WorldStudio.UI
         // Приветствие
         public const string WelcomeTitle = "MiniLife World Studio";
         public const string WelcomeSubtitle = "Весь мир игры в одном файле world.json";
-        public const string WelcomeNew = "Собрать мир из карт";
-        public const string WelcomeNewHint = "Ландшафт, политика и дикие земли из PixelBuilder";
+        public const string WelcomeNew = "Собрать из основных карт";
+        public const string WelcomeNewHint = "Три карты из data\\sources.json, сразу";
         public const string WelcomeOpen = "Открыть world.json";
         public const string WelcomeOpenHint = "Продолжить работу с миром";
         public const string WelcomeRecent = "Недавние";

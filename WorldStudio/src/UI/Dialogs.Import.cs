@@ -89,6 +89,47 @@ namespace MiniLife.WorldStudio.UI
         }
     }
 
+    // Основные карты из data/sources.json (D-34). Мир из них собирается сразу, без окна выбора (D-35).
+    internal static class PinnedSources
+    {
+        // Все три карты прочитаны - список источников; иначе null и причины по-русски.
+        public static List<LegacySource> Load(List<string> problems)
+        {
+            string path = AppPaths.SourcesPath;
+            if (!File.Exists(path)) { problems.Add("нет файла data\\sources.json"); return null; }
+            var result = new List<LegacySource>();
+            try
+            {
+                JsonObject root = JsonRead.Object(JsonParser.Parse(TextFileStore.ReadAllText(path)), "sources.json");
+                foreach (JsonNode item in JsonRead.RequiredArray(root, "sources", "sources.json").Items)
+                {
+                    JsonObject o = JsonRead.Object(item, "sources[]");
+                    string code = JsonRead.RequiredString(o, "semantic", "sources[].semantic");
+                    string file = JsonRead.RequiredString(o, "path", "sources[].path");
+                    MapSemantic semantic;
+                    if (!TryParseSemantic(code, out semantic)) { problems.Add("неизвестный смысл карты: " + code); continue; }
+                    if (!File.Exists(file)) { problems.Add("не найден файл " + file); continue; }
+                    PixelArchitectReadResult r = PixelArchitectCodec.Read(TextFileStore.ReadAllText(file));
+                    if (!r.Ok) { problems.Add(Path.GetFileName(file) + ": " + r.Error); continue; }
+                    if (r.Document.MapKind != "global") { problems.Add(Path.GetFileName(file) + ": это не глобальная карта"); continue; }
+                    result.Add(new LegacySource(semantic, Path.GetFileName(file), r.Document));
+                }
+            }
+            catch (JsonParseException ex) { problems.Add("data\\sources.json не прочитан: " + ex.Message); }
+            catch (JsonSchemaException ex) { problems.Add("data\\sources.json не прочитан: " + ex.Message); }
+            catch (IOException ex) { problems.Add("ошибка чтения: " + ex.Message); }
+            return problems.Count == 0 && result.Count > 0 ? result : null;
+        }
+
+        private static bool TryParseSemantic(string code, out MapSemantic semantic)
+        {
+            foreach (MapSemantic s in new[] { MapSemantic.Landscape, MapSemantic.Political, MapSemantic.Wildlands })
+                if (Legend.SemanticCode(s) == code) { semantic = s; return true; }
+            semantic = MapSemantic.Landscape;
+            return false;
+        }
+    }
+
     // Карточка одного файла: заголовок, превью или зона перетаскивания, имя файла, кнопки.
     internal sealed class SourceCard : Control
     {

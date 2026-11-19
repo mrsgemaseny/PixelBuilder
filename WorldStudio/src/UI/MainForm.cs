@@ -25,10 +25,10 @@ namespace MiniLife.WorldStudio.UI
         private readonly Timer _validateLater = new Timer { Interval = 350 };
 
         private UiSurface _welcome, _editor, _canvasHost, _left, _right, _inspector, _findingsPanel, _zoomBar;
-        private UiLabel _title, _subtitle, _paletteTitle, _zoomLabel, _findingsSummary;
+        private UiLabel _title, _subtitle, _paletteTitle, _zoomLabel, _findingsSummary, _welcomeNote;
         private UiSegmented _layers;
         private UiButton _undo, _redo, _check, _save;
-        private FlowLayoutPanel _palette, _routePanel, _recent;
+        private FlowLayoutPanel _palette, _routePanel;
         private UiSurface _routeSection;
         private FindingsList _findingsList;
         private readonly Dictionary<MapTool, UiButton> _tools = new Dictionary<MapTool, UiButton>();
@@ -60,58 +60,28 @@ namespace MiniLife.WorldStudio.UI
             _autosave.Start();
             _validateLater.Tick += (s, e) => { _validateLater.Stop(); RunValidation(); };
             SetDocument(null);
+            Shown += (s, e) => Guard("запуск", OpenOrCreateWorld);
         }
 
         // ================= приветствие =================
 
+        // Экран без мира показывается только при ошибке: причина и кнопка "Попробовать снова".
         private void BuildWelcome()
         {
             _welcome = new UiSurface(SurfaceRole.Window) { Dock = DockStyle.Fill };
-            var column = new UiSurface(SurfaceRole.Window) { Size = Ui.S(600, 560) };
+            var column = new UiSurface(SurfaceRole.Window) { Size = Ui.S(640, 260) };
             var title = new UiLabel(Strings.WelcomeTitle, TextRole.Large) { Dock = DockStyle.Top, Height = Ui.S(44), TextAlign = ContentAlignment.MiddleCenter };
-            var subtitle = new UiLabel(Strings.WelcomeSubtitle, TextRole.Secondary) { Dock = DockStyle.Top, Height = Ui.S(30), TextAlign = ContentAlignment.TopCenter };
-            var cards = new FlowLayoutPanel { Dock = DockStyle.Top, Height = Ui.S(176), BackColor = Color.Transparent, Padding = new Padding(Ui.S(14), Ui.S(18), 0, 0), WrapContents = false };
-            UiButton create = WelcomeCard(Strings.WelcomeNew, Strings.WelcomeNewHint, Glyph.Import, NewFromLegacy);
-            UiButton open = WelcomeCard(Strings.WelcomeOpen, Strings.WelcomeOpenHint, Glyph.Open, OpenWorld);
-            cards.Controls.Add(create);
-            cards.Controls.Add(open);
-            var recentHeader = new UiSectionHeader(Strings.WelcomeRecent, SurfaceRole.Window) { Padding = new Padding(Ui.S(18), 0, 0, 0) };
-            _recent = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Color.Transparent, Padding = new Padding(Ui.S(14), 0, 0, 0) };
-            column.Controls.Add(_recent);
-            column.Controls.Add(recentHeader);
-            column.Controls.Add(cards);
-            column.Controls.Add(subtitle);
+            _welcomeNote = new UiLabel("", TextRole.Warning) { Dock = DockStyle.Top, Height = Ui.S(90), TextAlign = ContentAlignment.MiddleCenter };
+            var retryRow = new UiSurface(SurfaceRole.Window) { Dock = DockStyle.Top, Height = Ui.S(40) };
+            var retry = new UiButton("Попробовать снова", ButtonKind.Primary) { Size = Ui.S(180, 34) };
+            retry.Click += (s, e) => Guard("запуск", OpenOrCreateWorld);
+            retryRow.Controls.Add(retry);
+            retryRow.Resize += (s, e) => retry.Location = new Point((retryRow.Width - retry.Width) / 2, 0);
+            column.Controls.Add(retryRow);
+            column.Controls.Add(_welcomeNote);
             column.Controls.Add(title);
             _welcome.Controls.Add(column);
             _welcome.Resize += (s, e) => column.Location = new Point(Math.Max(0, (_welcome.Width - column.Width) / 2), Math.Max(Ui.S(20), (_welcome.Height - column.Height) / 2 - Ui.S(20)));
-        }
-
-        private UiButton WelcomeCard(string title, string hint, Glyph icon, Action action)
-        {
-            var b = new UiButton(title, ButtonKind.Card) { Icon = icon, Detail = hint, Size = Ui.S(270, 150), Margin = new Padding(Ui.S(4), 0, Ui.S(16), 0) };
-            b.Click += (s, e) => Guard(title, action);
-            return b;
-        }
-
-        private void RefreshRecent()
-        {
-            _recent.Controls.Clear();
-            foreach (string path in Settings.Recent())
-            {
-                string p = path;
-                var row = new UiButton(Path.GetFileName(p), ButtonKind.Row) { Icon = Glyph.Map, Detail = ShortDir(p), Width = Ui.S(560), Height = Ui.S(34) };
-                row.Click += (s, e) => Guard("открытие", () => OpenPath(p));
-                Ui.Tip(row, p, null);
-                _recent.Controls.Add(row);
-            }
-            if (_recent.Controls.Count == 0)
-                _recent.Controls.Add(new UiLabel("Здесь появятся миры, которые вы открывали", TextRole.Tertiary) { AutoSize = true, Margin = new Padding(Ui.S(6), Ui.S(6), 0, 0) });
-        }
-
-        private static string ShortDir(string path)
-        {
-            string dir = Path.GetDirectoryName(path) ?? "";
-            return dir.Length > 48 ? "..." + dir.Substring(dir.Length - 45) : dir;
         }
 
         // ================= редактор =================
@@ -327,7 +297,7 @@ namespace MiniLife.WorldStudio.UI
             _doc = doc;
             _welcome.Visible = doc == null;
             _editor.Visible = doc != null;
-            if (doc == null) { RefreshRecent(); Text = Strings.AppTitle; return; }
+            if (doc == null) { Text = Strings.AppTitle; return; }
             _doc.Changed += OnDocumentChanged;
             if (_doc.Reference == null) _doc.Reference = LoadReference();
             _canvas.Document = doc;
@@ -379,38 +349,44 @@ namespace MiniLife.WorldStudio.UI
             return r == 1;
         }
 
-        private void NewFromLegacy()
+        // Единый мир - WorldStudio\world.json (D-36). Есть - открывается. Нет - один раз собирается
+        // из основных карт (data/sources.json) и сразу сохраняется. Выбора файлов нет.
+        private void OpenOrCreateWorld()
         {
-            if (!ConfirmDiscard()) return;
-            using (var dialog = new ImportForm())
+            string worldPath = AppPaths.WorldPath;
+            if (File.Exists(worldPath)) { OpenPath(worldPath); return; }
+            var problems = new List<string>();
+            List<LegacySource> sources = PinnedSources.Load(problems);
+            string error = null;
+            WorldDocument doc = sources == null ? null : WorldDocument.FromImport(TextFileStore.ReadAllText(AppPaths.TemplatePath), sources, null, out error);
+            if (doc == null)
             {
-                if (dialog.ShowDialog(this) != DialogResult.OK) return;
-                string error;
-                WorldDocument doc = WorldDocument.FromImport(TextFileStore.ReadAllText(AppPaths.TemplatePath), dialog.Sources, null, out error);
-                if (doc == null) { Dialogs.Error(this, error); return; }
-                SetDocument(doc);
-                _toast.Show("Мир собран из " + Labels.Plural(dialog.Sources.Count, "файла", "файлов", "файлов") + ". Сохраните его как world.json", ToastKind.Success);
+                if (error != null) problems.Add(error);
+                ShowStartupProblem("Основные карты не открылись: " + string.Join("; ", problems.ToArray()));
+                return;
             }
+            doc.SaveAs(worldPath);
+            SetDocument(doc);
+            _toast.Show("Создан world.json из основных карт", ToastKind.Success);
         }
 
-        private void OpenWorld()
+        private void ShowStartupProblem(string text)
         {
-            if (_busy || !ConfirmDiscard()) return;
-            using (var ofd = new OpenFileDialog { Filter = Strings.FilterWorld })
-                if (ofd.ShowDialog(this) == DialogResult.OK) OpenPath(ofd.FileName);
+            ErrorLog.Write(text, (Exception)null);
+            SetDocument(null);
+            _welcomeNote.Text = text;
         }
 
         private async void OpenPath(string path)
         {
             if (_busy) return;
-            if (_doc != null && !ConfirmDiscard()) return;
             string error = null;
             WorldDocument doc = null;
             SetBusy(true);
             try { doc = await Task.Run(() => WorldDocument.Open(path, null, out error)); }
             catch (Exception ex) { Dialogs.Unexpected(this, "открытие " + path, ex); return; }
             finally { SetBusy(false); }
-            if (doc == null) { Dialogs.Error(this, "Не удалось открыть " + Path.GetFileName(path) + ".\n" + error); return; }
+            if (doc == null) { ShowStartupProblem("Не удалось открыть " + path + ": " + error); return; }
             Settings.AddRecent(doc.FilePath);
             SetDocument(doc);
         }
@@ -486,9 +462,6 @@ namespace MiniLife.WorldStudio.UI
         private void ShowMoreMenu(Control anchor)
         {
             ContextMenuStrip menu = UiMenuRenderer.Menu();
-            UiMenuRenderer.Item(menu.Items, "Собрать мир из карт PixelBuilder...", "Ctrl+N", () => Guard("импорт", NewFromLegacy));
-            UiMenuRenderer.Item(menu.Items, "Открыть world.json...", "Ctrl+O", () => Guard("открытие", OpenWorld));
-            UiMenuRenderer.Item(menu.Items, "Сохранить как...", "Ctrl+Shift+S", () => Guard("сохранение", () => SaveWorld(true)));
             ToolStripMenuItem export = UiMenuRenderer.Item(menu.Items, "Экспорт в PixelBuilder", null, null);
             export.DropDown = UiMenuRenderer.Menu();
             UiMenuRenderer.Item(export.DropDownItems, "Карта ландшафтов...", null, () => Guard("экспорт", () => ExportLegacy(MapSemantic.Landscape)));
@@ -857,10 +830,7 @@ namespace MiniLife.WorldStudio.UI
         {
             switch (keyData)
             {
-                case Keys.Control | Keys.N: Guard("импорт", NewFromLegacy); return true;
-                case Keys.Control | Keys.O: Guard("открытие", OpenWorld); return true;
                 case Keys.Control | Keys.S: Guard("сохранение", () => SaveWorld(false)); return true;
-                case Keys.Control | Keys.Shift | Keys.S: Guard("сохранение", () => SaveWorld(true)); return true;
             }
             if (_doc == null) return base.ProcessCmdKey(ref msg, keyData);
             switch (keyData)
